@@ -1,0 +1,47 @@
+name: Execução Diária SOF
+
+on:
+  schedule:
+    # 8 da manhã (horário de Brasília) = 11:00 UTC
+    - cron: '0 11 * * *'
+  workflow_dispatch: # Permite execução manual
+
+jobs:
+  sof_execution:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+          
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests pytz openpyxl
+          
+      - name: Executar consulta_sof.py
+        env:
+          API_TOKEN_SF: ${{ secrets.API_TOKEN_SF }}
+          CNPJ_ADESAMPA: ${{ secrets.CNPJ_ADESAMPA }}
+        run: python consulta_sof.py
+        
+      - name: Executar send_reports.py
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: python send_reports.py
+        
+      - name: Upload relatórios como artefatos
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: relatorios-sof
+          path: base_execucao/
+          retention-days: 30
