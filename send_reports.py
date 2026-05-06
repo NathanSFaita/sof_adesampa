@@ -4,6 +4,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email import encoders
 from datetime import datetime
 from consulta_sof import input_with_timeout
@@ -58,6 +59,19 @@ def get_recipients(emails_file_path):
         print(f"Erro ao ler arquivo de e-mails {emails_file_path}: {e}. Nenhum e-mail será enviado.")
         return []
 
+def formatar_brl_email(valor):
+    """Formata um valor numérico para o formato BRL (R$ x.xxx,xx)"""
+    if pd.isna(valor) or valor == '' or valor == 'nan' or valor == '-':
+        return valor if valor == '-' else '-'
+    try:
+        # Se já está formatado como BRL, retorna como está
+        if isinstance(valor, str) and valor.startswith('R$'):
+            return valor
+        num = float(str(valor).replace('.', '').replace(',', '.'))
+        return f"R$ {num:,.2f}".replace(',', '#').replace('.', ',').replace('#', '.')
+    except:
+        return str(valor)
+
 def prepare_html_body(base_exec_path):
     """
     Prepara o corpo do e-mail em formato HTML com as tabelas de mudanças.
@@ -65,48 +79,95 @@ def prepare_html_body(base_exec_path):
     has_changes = False
     today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
     tables_html = ""
+    
+    # Estilos inline para tabelas (usados no to_html)
+    table_style = 'style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"'
+    th_style = 'style="background-color:#003366;color:white;padding:12px;text-align:left;border:1px solid #ddd;"'
+    td_style = 'style="padding:8px 12px;border:1px solid #ddd;"'
 
     # --- Mudanças de Despesas (Execução Orçamentária) ---
     path_mudancas_exec = os.path.join(base_exec_path, "mudancas_execucao.xlsx")
     if os.path.exists(path_mudancas_exec):
         try:
             df_mudancas_exec = pd.read_excel(path_mudancas_exec)
-            if not df_mudancas_exec.empty and 'data_hora_extracao' in df_mudancas_exec.columns:
-                # Verifica se a data do relatório (armazenada na coluna) é hoje
-                report_date = str(df_mudancas_exec['data_hora_extracao'].iloc[0]).split(' ')[0]
+            if not df_mudancas_exec.empty and 'Data/Hora Extração' in df_mudancas_exec.columns:
+                report_date = str(df_mudancas_exec['Data/Hora Extração'].iloc[0]).split(' ')[0]
                 if report_date == today_str:
                     has_changes = True
-                    tables_html += "<h3>Mudanças nas Despesas (Execução Orçamentária)</h3>"
-                    tables_html += df_mudancas_exec.to_html(index=False, border=1)
+                    tables_html += "<h3 style='color: #003366;'>📊 Mudanças na Execução Orçamentária dos Contratos de Gestão</h3>"
+                    df_display = df_mudancas_exec.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
+                    # Reordena as colunas para garantir a ordem desejada
+                    colunas_ordenadas = [
+                        'Sigla Órgão',
+                        'Tipo de Mudança',
+                        'Dotação',
+                        'Dotação Exclusiva',
+                        'Campo Alterado',
+                        'Valor Anterior',
+                        'Valor Atualizado',
+                        'Detalhes'
+                    ]
+                    colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
+                    df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
+                    # Formata valores BRL em todas as colunas de valores
+                    for col in df_display.columns:
+                        if any(x in col.lower() for x in ['valor', 'saldo']):
+                            df_display[col] = df_display[col].apply(formatar_brl_email)
+                    html_table = df_display.to_html(index=False, border=1, escape=False, render_links=False, table_id=None, justify='center', classes=None, header=True, na_rep='')
+                    html_table = html_table.replace('<table', f'<table {table_style}', 1)
+                    html_table = html_table.replace('<th>', f'<th {th_style}>').replace('<td>', f'<td {td_style}>')
+                    tables_html += html_table
                 else:
-                    tables_html += "<p>Nenhuma mudança detectada hoje nas Despesas (Execução Orçamentária).</p>"
+                    tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Nenhuma mudança detectada hoje.</p>"
             else:
-                tables_html += "<p>Nenhuma mudança detectada nas Despesas (Execução Orçamentária).</p>"
+                tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Nenhuma mudança detectada.</p>"
         except Exception as e:
-            tables_html += f"<p>Erro ao carregar relatório de mudanças de execução: {e}</p>"
+            tables_html += f"<p><strong>Despesas (Execução Orçamentária):</strong> Erro ao carregar relatório - {e}</p>"
     else:
-        tables_html += "<p>Relatório de mudanças de execução não encontrado.</p>"
+        tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Relatório não encontrado.</p>"
 
     # --- Mudanças de Empenhos ---
     path_mudancas_empenhos = os.path.join(base_exec_path, "mudancas_empenhos.xlsx")
     if os.path.exists(path_mudancas_empenhos):
         try:
             df_mudancas_empenhos = pd.read_excel(path_mudancas_empenhos)
-            if not df_mudancas_empenhos.empty and 'data_hora_extracao' in df_mudancas_empenhos.columns:
-                # Verifica se a data do relatório (armazenada na coluna) é hoje
-                report_date = str(df_mudancas_empenhos['data_hora_extracao'].iloc[0]).split(' ')[0]
+            if not df_mudancas_empenhos.empty and 'Data/Hora Extração' in df_mudancas_empenhos.columns:
+                report_date = str(df_mudancas_empenhos['Data/Hora Extração'].iloc[0]).split(' ')[0]
                 if report_date == today_str:
                     has_changes = True
-                    tables_html += "<h3>Mudanças nos Empenhos</h3>"
-                    tables_html += df_mudancas_empenhos.to_html(index=False, border=1)
+                    tables_html += "<h3 style='color: #003366;'>📋 Mudanças nos Empenhos</h3>"
+                    df_display = df_mudancas_empenhos.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
+                    # Reordena as colunas para garantir a ordem desejada
+                    colunas_ordenadas = [
+                        'Sigla Órgão',
+                        'Processo SEI',
+                        'Tipo de Mudança',
+                        'Dotação',
+                        'Código do Empenho',
+                        'Número do Contrato',
+                        'Campo Alterado',
+                        'Valor Anterior',
+                        'Valor Atualizado',
+                        'Detalhes'
+                    ]
+                    colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
+                    df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
+                    # Formata valores BRL em todas as colunas de valores
+                    for col in df_display.columns:
+                        if any(x in col.lower() for x in ['valor', 'saldo']):
+                            df_display[col] = df_display[col].apply(formatar_brl_email)
+                    html_table = df_display.to_html(index=False, border=1, escape=False, render_links=False, table_id=None, justify='center', classes=None, header=True, na_rep='')
+                    html_table = html_table.replace('<table', f'<table {table_style}', 1)
+                    html_table = html_table.replace('<th>', f'<th {th_style}>').replace('<td>', f'<td {td_style}>')
+                    tables_html += html_table
                 else:
-                    tables_html += "<p>Nenhuma mudança detectada hoje nos Empenhos.</p>"
+                    tables_html += "<p><strong>Empenhos:</strong> Nenhuma mudança detectada hoje.</p>"
             else:
-                tables_html += "<p>Nenhuma mudança detectada nos Empenhos.</p>"
+                tables_html += "<p><strong>Empenhos:</strong> Nenhuma mudança detectada.</p>"
         except Exception as e:
-            tables_html += f"<p>Erro ao carregar relatório de mudanças de empenhos: {e}</p>"
+            tables_html += f"<p><strong>Empenhos:</strong> Erro ao carregar relatório - {e}</p>"
     else:
-        tables_html += "<p>Relatório de mudanças de empenhos não encontrado.</p>"
+        tables_html += "<p><strong>Empenhos:</strong> Relatório não encontrado.</p>"
 
     return tables_html, has_changes
 
@@ -128,6 +189,23 @@ def attach_file(message, filepath):
         message.attach(part)
     except Exception as e:
         print(f"Erro ao anexar arquivo {filepath}: {e}")
+
+def attach_signature_image(message, image_path):
+    """Anexa a imagem de assinatura ao e-mail com Content-ID para referência no HTML."""
+    if not os.path.exists(image_path):
+        print(f"Aviso: Imagem de assinatura não encontrada: {image_path}")
+        return False
+    
+    try:
+        with open(image_path, "rb") as img_file:
+            img = MIMEImage(img_file.read())
+            img.add_header('Content-ID', '<signature>')
+            img.add_header('Content-Disposition', 'inline', filename='assinatura.png')
+            message.attach(img)
+        return True
+    except Exception as e:
+        print(f"Erro ao anexar imagem de assinatura {image_path}: {e}")
+        return False
 
 # --- Função Principal de Envio de E-mail ---
 
@@ -172,11 +250,17 @@ def send_reports_email():
                     <p>Informo que houveram mudanças na execução orçamentária dos contratos de gestão, conforme está informado nas tabelas abaixo. 
                     Segue anexo os arquivos atualizados contendo a situação das dotações orçamentárias dos contratos de gestão e dos nossos empenhos</p>
                     {tables_content}
-                    <p>Atenciosamente,<br>Nathan Faita</p>
+                    <p>Atenciosamente,<br>
+                    <img src="cid:signature" style="max-width: 300px; height: auto;">
+                    </p>
                 </body>
                 </html>
                 """
-                msg.attach(MIMEText(html_body, 'html'))
+                msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+
+                # Adiciona a assinatura como imagem embutida
+                signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
+                attach_signature_image(msg, signature_path)
 
                 # Adiciona os anexos
                 attach_file(msg, os.path.join(BASE_EXEC, "execucao.xlsx"))

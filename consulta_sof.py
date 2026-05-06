@@ -84,6 +84,16 @@ def main():
                 df_norm[col] = df_norm[col].astype(str).replace(['nan', 'None', '<NA>'], '').str.strip()
                 df_norm[col] = df_norm[col].replace('', None)
         return df_norm
+    
+    def formatar_brl(valor):
+        """Formata um valor numérico para o formato BRL (R$ x.xxx,xx)"""
+        if pd.isna(valor) or valor == '' or valor == 'nan' or valor == '-':
+            return valor if valor == '-' else '-'
+        try:
+            num = float(str(valor).replace('.', '').replace(',', '.'))
+            return f"R$ {num:,.2f}".replace(',', '#').replace('.', ',').replace('#', '.')
+        except:
+            return str(valor)
         
     # Consulta à base de despesas
 
@@ -113,6 +123,9 @@ def main():
     except FileNotFoundError:
         print("Erro: Arquivo dotacoes.xlsx não encontrado.")
         sys.exit(1)
+
+    # Criar dicionário de lookup: codOrgao -> contrato_gestao (sigla)
+    lookup_orgao_sigla = dict(zip(df_dotacoes['orgao'].astype(str), df_dotacoes['contrato_gestao'].astype(str)))
 
     list_df_despesas = []
 
@@ -167,6 +180,9 @@ def main():
         df_final = pd.concat(list_df_despesas, ignore_index=True)
     else:
         df_final = pd.DataFrame(columns=colunas_iniciais)
+
+    # Calcular saldo da dotação
+    df_final['saldo_dotacao'] = df_final['valDisponivel'] - df_final['valReservadoLiquido']
 
     df_final['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
     df_final.to_excel(os.path.join(BASE_EXEC, f"execucao.xlsx"), index=False)
@@ -277,6 +293,10 @@ def main():
     if list_empenhos:
         df_final_empenhos = pd.concat(list_empenhos, ignore_index=True)
 
+    # Adicionar sigla do órgão utilizando lookup
+    if not df_final_empenhos.empty:
+        df_final_empenhos['sigla_orgao'] = df_final_empenhos['codOrgao'].astype(str).map(lookup_orgao_sigla).fillna('')
+
     df_final_empenhos['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
     df_final_empenhos.to_excel(os.path.join(BASE_EXEC, f"empenhos.xlsx"), index=False)
 
@@ -313,7 +333,9 @@ def main():
                 "tipo_mudanca": "REMOVIDA",
                 "dotacao": dotacao,
                 "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
-                "detalhes": str(row.to_dict())
+                "valor_anterior": "-",
+                "valor_novo": "-",
+                "detalhes": "Linha removida"
             })
 
     # 2. Linhas adicionadas (em final mas não em anterior)
@@ -325,7 +347,9 @@ def main():
             mudancas_exec.append({
                 "tipo_mudanca": "ADICIONADA",
                 "dotacao": dotacao,
-                "dotacao_exclusiva": row.get('dotacao_exclusiva', '')
+                "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
+                "valor_anterior": "-",
+                "valor_novo": "-"
             })
 
     # 3. Linhas modificadas (comparar célula por célula)
@@ -366,6 +390,54 @@ def main():
     if mudancas_exec:
         df_mudancas = pd.DataFrame(mudancas_exec)
         df_mudancas['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
+        
+        # Preencher NaN em colunas numéricas com valor padrão para linhas sem valores específicos
+        if 'valor_anterior' in df_mudancas.columns:
+            df_mudancas['valor_anterior'] = df_mudancas['valor_anterior'].fillna('-')
+        if 'valor_novo' in df_mudancas.columns:
+            df_mudancas['valor_novo'] = df_mudancas['valor_novo'].fillna('-')
+        
+        # Adicionar sigla do órgão usando lookup
+        def get_sigla_from_dotacao(dotacao_str):
+            if pd.isna(dotacao_str) or dotacao_str == '':
+                return ''
+            # A dotação tem o formato: orgao.uo.funcao...
+            try:
+                orgao = dotacao_str.split('.')[0]
+                sigla = lookup_orgao_sigla.get(orgao, '')
+                return sigla
+            except:
+                return ''
+        
+        df_mudancas['sigla_orgao'] = df_mudancas['dotacao'].apply(get_sigla_from_dotacao)
+        
+        # Renomeia para nomes amigáveis
+        df_mudancas = df_mudancas.rename(columns={
+            "sigla_orgao": "Sigla Órgão",
+            "tipo_mudanca": "Tipo de Mudança",
+            "dotacao": "Dotação",
+            "dotacao_exclusiva": "Dotação Exclusiva",
+            "coluna": "Campo Alterado",
+            "valor_anterior": "Valor Anterior",
+            "valor_novo": "Valor Atualizado",
+            "detalhes": "Detalhes",
+            "data_hora_extracao": "Data/Hora Extração"
+        })
+        
+        # Reordenar colunas: Sigla Órgão como primeira, Valor Atualizado na penúltima, Data/Hora Extração na última
+        # Usar apenas as colunas que existem
+        colunas_ordenadas = ['Sigla Órgão', 'Tipo de Mudança', 'Dotação', 'Dotação Exclusiva', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Detalhes', 'Data/Hora Extração']
+        colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas.columns]
+        # Adicionar qualquer coluna extra que não estava na lista
+        colunas_extra = [c for c in df_mudancas.columns if c not in colunas_existentes]
+        df_mudancas = df_mudancas[colunas_existentes + colunas_extra]
+        
+        # Formatar colunas de valores para BRL
+        if 'Valor Anterior' in df_mudancas.columns:
+            df_mudancas['Valor Anterior'] = df_mudancas['Valor Anterior'].apply(formatar_brl)
+        if 'Valor Atualizado' in df_mudancas.columns:
+            df_mudancas['Valor Atualizado'] = df_mudancas['Valor Atualizado'].apply(formatar_brl)
+        
         df_mudancas.to_excel(os.path.join(BASE_EXEC, f"mudancas_execucao.xlsx"), index=False)
         print(f"\n📊 Relatório salvo em: mudancas_execucao.xlsx")
     else:
@@ -454,9 +526,9 @@ def main():
             row = final_emp_dict[eid]
             mudancas_emp.append({
                 "tipo_mudanca": "ADICIONADA",
+                "numProcesso": row.get('codProcesso', ''),
                 "dotacao": row.get('dotacao_completa', ''),
                 "codEmpenho": eid,
-                "numProcesso": row.get('codProcesso', ''),
                 "numeroOriginalContrato": row.get('numeroOriginalContrato', '')
             })
 
@@ -491,6 +563,53 @@ def main():
     if mudancas_emp:
         df_mudancas_emp = pd.DataFrame(mudancas_emp)
         df_mudancas_emp['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
+        
+        # Preencher NaN em colunas numéricas com valor padrão para linhas sem valores específicos
+        if 'valor_anterior' in df_mudancas_emp.columns:
+            df_mudancas_emp['valor_anterior'] = df_mudancas_emp['valor_anterior'].fillna('-')
+        if 'valor_novo' in df_mudancas_emp.columns:
+            df_mudancas_emp['valor_novo'] = df_mudancas_emp['valor_novo'].fillna('-')
+        
+        # Adicionar sigla do órgão usando lookup
+        def get_sigla_from_dotacao(dotacao_str):
+            if pd.isna(dotacao_str) or dotacao_str == '':
+                return ''
+            # A dotação tem o formato: orgao.uo.funcao...
+            try:
+                orgao = dotacao_str.split('.')[0]
+                return lookup_orgao_sigla.get(orgao, '')
+            except:
+                return ''
+        
+        df_mudancas_emp['sigla_orgao'] = df_mudancas_emp['dotacao'].apply(get_sigla_from_dotacao)
+        
+        # Renomeia para nomes amigáveis
+        df_mudancas_emp = df_mudancas_emp.rename(columns={
+            "sigla_orgao": "Sigla Órgão",
+            "numProcesso": "Processo SEI",
+            "tipo_mudanca": "Tipo de Mudança",
+            "dotacao": "Dotação",
+            "codEmpenho": "Código do Empenho",
+            "numeroOriginalContrato": "Número do Contrato",
+            "coluna": "Campo Alterado",
+            "valor_anterior": "Valor Anterior",
+            "valor_novo": "Valor Atualizado",
+            "detalhes": "Detalhes",
+            "data_hora_extracao": "Data/Hora Extração"
+        })
+        
+        # Reordenar colunas: Sigla Órgão como primeira coluna, Processo SEI como segunda
+        colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Tipo de Mudança', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Detalhes', 'Data/Hora Extração']
+        colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas_emp.columns]
+        colunas_extra = [c for c in df_mudancas_emp.columns if c not in colunas_existentes]
+        df_mudancas_emp = df_mudancas_emp[colunas_existentes + colunas_extra]
+        
+        # Formatar colunas de valores para BRL
+        if 'Valor Anterior' in df_mudancas_emp.columns:
+            df_mudancas_emp['Valor Anterior'] = df_mudancas_emp['Valor Anterior'].apply(formatar_brl)
+        if 'Valor Atualizado' in df_mudancas_emp.columns:
+            df_mudancas_emp['Valor Atualizado'] = df_mudancas_emp['Valor Atualizado'].apply(formatar_brl)
+        
         df_mudancas_emp.to_excel(os.path.join(BASE_EXEC, f"mudancas_empenhos.xlsx"), index=False)
         print(f"\n📊 Relatório salvo em: mudancas_empenhos.xlsx")
     else:
