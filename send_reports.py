@@ -10,6 +10,11 @@ from datetime import datetime
 from consulta_sof import input_with_timeout
 import pytz
 
+# Google Drive
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
 # Configuração de fuso horário
 tz_brasilia = pytz.timezone('America/Sao_Paulo')
 
@@ -22,13 +27,21 @@ EMAILS_FILE = os.path.join(AUX_FILES_PATH, "emails.xlsx")
 # --- Variáveis de Ambiente para E-mail ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com") # Padrão para Gmail
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587)) # Padrão para TLS
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")  # Padrão para Gmail
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))  # Padrão para TLS
+
+# --- Variáveis de Ambiente para Google Drive ---
+SERVICE_ACCOUNT_FILE = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+    os.path.join(BASE_PATH, "service_account.json")
+)
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
 if not EMAIL_SENDER:
     print("AVISO: Variável de ambiente EMAIL_SENDER não configurada. Insira manualmente.")
     EMAIL_SENDER = input_with_timeout("Digite o e-mail do remetente (EMAIL_SENDER): ", timeout=30)
     EMAIL_PASSWORD = input_with_timeout("Digite a senha do remetente (EMAIL_PASSWORD): ", timeout=30)
+    DRIVE_FOLDER_ID = input_with_timeout("Digite o ID da pasta do Google Drive para upload (DRIVE_FOLDER_ID): ", timeout=30)
 
 # --- Funções Auxiliares ---
 
@@ -64,7 +77,6 @@ def formatar_brl_email(valor):
     if pd.isna(valor) or valor == '' or valor == 'nan' or valor == '-':
         return valor if valor == '-' else '-'
     try:
-        # Se já está formatado como BRL, retorna como está
         if isinstance(valor, str) and valor.startswith('R$'):
             return valor
         num = float(str(valor).replace('.', '').replace(',', '.'))
@@ -80,7 +92,6 @@ def prepare_html_body(base_exec_path):
     today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
     tables_html = ""
     
-    # Estilos inline para tabelas (usados no to_html)
     table_style = 'style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"'
     th_style = 'style="background-color:#003366;color:white;padding:12px;text-align:left;border:1px solid #ddd;"'
     td_style = 'style="padding:8px 12px;border:1px solid #ddd;"'
@@ -96,7 +107,6 @@ def prepare_html_body(base_exec_path):
                     has_changes = True
                     tables_html += "<h3 style='color: #003366;'>📊 Mudanças na Execução Orçamentária dos Contratos de Gestão</h3>"
                     df_display = df_mudancas_exec.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
-                    # Reordena as colunas para garantir a ordem desejada
                     colunas_ordenadas = [
                         'Sigla Órgão',
                         'Tipo de Mudança',
@@ -109,7 +119,6 @@ def prepare_html_body(base_exec_path):
                     ]
                     colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
                     df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
-                    # Formata valores BRL em todas as colunas de valores
                     for col in df_display.columns:
                         if any(x in col.lower() for x in ['valor', 'saldo']):
                             df_display[col] = df_display[col].apply(formatar_brl_email)
@@ -137,7 +146,6 @@ def prepare_html_body(base_exec_path):
                     has_changes = True
                     tables_html += "<h3 style='color: #003366;'>📋 Mudanças nos Empenhos</h3>"
                     df_display = df_mudancas_empenhos.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
-                    # Reordena as colunas para garantir a ordem desejada
                     colunas_ordenadas = [
                         'Sigla Órgão',
                         'Processo SEI',
@@ -152,7 +160,6 @@ def prepare_html_body(base_exec_path):
                     ]
                     colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
                     df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
-                    # Formata valores BRL em todas as colunas de valores
                     for col in df_display.columns:
                         if any(x in col.lower() for x in ['valor', 'saldo']):
                             df_display[col] = df_display[col].apply(formatar_brl_email)
@@ -176,7 +183,6 @@ def attach_file(message, filepath):
     if not os.path.exists(filepath):
         print(f"Aviso: Arquivo não encontrado para anexar: {filepath}")
         return
-
     try:
         with open(filepath, "rb") as attachment:
             part = MIMEBase("application", "octet-stream")
@@ -195,7 +201,6 @@ def attach_signature_image(message, image_path):
     if not os.path.exists(image_path):
         print(f"Aviso: Imagem de assinatura não encontrada: {image_path}")
         return False
-    
     try:
         with open(image_path, "rb") as img_file:
             img = MIMEImage(img_file.read())
@@ -206,6 +211,81 @@ def attach_signature_image(message, image_path):
     except Exception as e:
         print(f"Erro ao anexar imagem de assinatura {image_path}: {e}")
         return False
+
+# --- Google Drive ---   
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+def build_drive_service():
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        print(f"Erro: serviço de conta Google não encontrado em {SERVICE_ACCOUNT_FILE}")
+        return None
+    try:
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        print(f"Erro ao criar serviço do Google Drive: {e}")
+        return None
+
+def get_file_in_folder(service, file_name, folder_id):
+    # Para Shared Drives, assumindo que folder_id é o ID do drive
+    try:
+        response = service.files().list(
+            q=f"name = '{file_name}' and trashed = false",
+            corpora='drive',
+            driveId=folder_id,
+            fields="files(id, name)",
+            pageSize=1,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True  # Adicionado
+        ).execute()
+        files = response.get("files", [])
+        print(f"Buscando {file_name} no folder {folder_id}: encontrou {len(files)} arquivos")
+        return files[0]["id"] if files else None
+    except Exception as e:
+        print(f"Erro ao buscar arquivo no Drive ({file_name}): {e}")
+        return None
+
+def upload_or_update_file(service, file_path, folder_id):
+    if not os.path.exists(file_path):
+        print(f"Aviso: arquivo não existe para upload no Drive: {file_path}")
+        return None
+    file_name = os.path.basename(file_path)
+    try:
+        existing_file_id = get_file_in_folder(service, file_name, folder_id)
+        media = MediaFileUpload(file_path, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if existing_file_id:
+            try:
+                service.files().update(fileId=existing_file_id, media_body=media, supportsAllDrives=True).execute()
+                print(f"Arquivo atualizado no Google Drive: {file_name}")
+                return existing_file_id
+            except Exception as update_error:
+                if "404" in str(update_error) or "notFound" in str(update_error):
+                    print(f"Arquivo {file_name} não encontrado para update, criando novo...")
+                    metadata = {"name": file_name, "parents": [folder_id]}
+                    created = service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
+                    print(f"Arquivo criado no Google Drive: {file_name}")
+                    return created.get("id")
+                else:
+                    print(f"Erro ao atualizar arquivo no Google Drive ({file_name}): {update_error}")
+                    return None
+        else:
+            metadata = {"name": file_name, "parents": [folder_id]}
+            created = service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
+            print(f"Arquivo criado no Google Drive: {file_name}")
+            return created.get("id")
+    except Exception as e:
+        print(f"Erro ao enviar arquivo para o Google Drive ({file_name}): {e}")
+        return None
+
+def upload_reports_to_drive(file_paths):
+    if not DRIVE_FOLDER_ID:
+        print("Drive não configurado: variável de ambiente DRIVE_FOLDER_ID ausente.")
+        return
+    service = build_drive_service()
+    if not service:
+        return
+    for path in file_paths:
+        upload_or_update_file(service, path, DRIVE_FOLDER_ID)
 
 # --- Função Principal de Envio de E-mail ---
 
@@ -219,7 +299,6 @@ def send_reports_email():
         print("ERRO CRÍTICO: Nenhum destinatário válido encontrado. E-mail não será enviado.")
         return
 
-    # Verifica mudanças uma única vez antes de iniciar o envio
     tables_content, has_changes = prepare_html_body(BASE_EXEC)
 
     if not has_changes:
@@ -230,7 +309,6 @@ def send_reports_email():
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-
             for recipient in recipients_data:
                 nome = recipient['nome']
                 email = recipient['email']
@@ -258,16 +336,20 @@ def send_reports_email():
                 """
                 msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-                # Adiciona a assinatura como imagem embutida
                 signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
                 attach_signature_image(msg, signature_path)
 
-                # Adiciona os anexos
                 attach_file(msg, os.path.join(BASE_EXEC, "execucao.xlsx"))
                 attach_file(msg, os.path.join(BASE_EXEC, "empenhos.xlsx"))
 
                 server.send_message(msg)
                 print(f"E-mail enviado com sucesso para: {email}")
+
+        # Upload para Google Drive após o envio de e-mail
+        upload_reports_to_drive([
+            os.path.join(BASE_EXEC, "execucao.xlsx"),
+            os.path.join(BASE_EXEC, "empenhos.xlsx"),
+        ])
 
     except smtplib.SMTPAuthenticationError:
         print("ERRO: Falha na autenticação SMTP. Verifique o EMAIL_SENDER e EMAIL_PASSWORD.")
