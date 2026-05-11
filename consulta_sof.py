@@ -73,12 +73,18 @@ def main():
     def normalizar_para_comparacao(df):
         """Normaliza dataframe para comparação consistente de valores"""
         df_norm = df.copy()
+        # Colunas que NUNCA devem ser tratadas como números para evitar zeros indevidos ou aglutinações
+        cols_texto = ['dotacao', 'codEmpenho', 'codProcesso', 'dotacao_completa', 'numeroOriginalContrato', 'Processo SEI']
+        
         for col in df_norm.columns:
+            if col in cols_texto:
+                df_norm[col] = df_norm[col].astype(str).replace(['nan', 'None', '<NA>'], '').str.strip()
+                continue
+                
             # Tentar converter para numérico
             coerced = pd.to_numeric(df_norm[col], errors='coerce')
-            # Se a coluna tem pelo menos um valor numérico, trata como numérica
             if pd.api.types.is_numeric_dtype(coerced) and not coerced.isnull().all():
-                # Preencher NaN com 0 para evitar diferenças de nulos
+                # Arredondamento fixo para evitar diferenças infinitesimais de float
                 df_norm[col] = coerced.fillna(0).round(2)
             else:
                 df_norm[col] = df_norm[col].astype(str).replace(['nan', 'None', '<NA>'], '').str.strip()
@@ -87,10 +93,11 @@ def main():
     
     def formatar_brl(valor):
         """Formata um valor numérico para o formato BRL (R$ x.xxx,xx)"""
-        if pd.isna(valor) or valor == '' or valor == 'nan' or valor == '-':
+        if pd.isna(valor) or str(valor).strip() in ['', 'nan', '-', 'None']:
             return valor if valor == '-' else '-'
         try:
-            num = float(str(valor).replace('.', '').replace(',', '.'))
+            # Converte para float sem manipulação de string prévia para evitar erros de milhar/decimal
+            num = float(valor)
             return f"R$ {num:,.2f}".replace(',', '#').replace('.', ',').replace('#', '.')
         except:
             return str(valor)
@@ -124,8 +131,20 @@ def main():
         print("Erro: Arquivo dotacoes.xlsx não encontrado.")
         sys.exit(1)
 
-    # Criar dicionário de lookup: codOrgao -> contrato_gestao (sigla)
-    lookup_orgao_sigla = dict(zip(df_dotacoes['orgao'].astype(str), df_dotacoes['contrato_gestao'].astype(str)))
+    # Criar dicionário de lookup: (orgao, proj_ativ) -> contrato_gestao (sigla)
+    # Também mantém lookup por orgao apenas para casos onde proj_ativ não está disponível
+    lookup_orgao_proj_ativ_sigla = {}
+    lookup_orgao_sigla = {}  # fallback para quando proj_ativ não estiver disponível
+    
+    for _, row in df_dotacoes.iterrows():
+        orgao = str(row['orgao'])
+        proj_ativ = str(row['proj_ativ'])
+        sigla = str(row['contrato_gestao'])
+        # Lookup com proj_ativ como primeira tentativa
+        chave_completa = f"{orgao}_{proj_ativ}"
+        lookup_orgao_proj_ativ_sigla[chave_completa] = sigla
+        # Fallback: apenas orgao (será sobrescrito se houver múltiplas entradas)
+        lookup_orgao_sigla[orgao] = sigla
 
     list_df_despesas = []
 
@@ -293,9 +312,26 @@ def main():
     if list_empenhos:
         df_final_empenhos = pd.concat(list_empenhos, ignore_index=True)
 
-    # Adicionar sigla do órgão utilizando lookup
+    # Adicionar sigla do órgão utilizando lookup (considerando proj_ativ)
     if not df_final_empenhos.empty:
-        df_final_empenhos['sigla_orgao'] = df_final_empenhos['codOrgao'].astype(str).map(lookup_orgao_sigla).fillna('')
+        def get_sigla_for_empenho(row):
+            try:
+                orgao = str(row['codOrgao']).zfill(2)
+                proj_ativ = str(row['codProjetoAtividade']).zfill(4) if 'codProjetoAtividade' in row else ''
+                
+                # Tentar primeiro com orgao + proj_ativ
+                if proj_ativ:
+                    chave_completa = f"{orgao}_{proj_ativ}"
+                    sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
+                    if sigla:
+                        return sigla
+                
+                # Fallback: apenas orgao
+                return lookup_orgao_sigla.get(orgao, '')
+            except:
+                return ''
+        
+        df_final_empenhos['sigla_orgao'] = df_final_empenhos.apply(get_sigla_for_empenho, axis=1)
 
     df_final_empenhos['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
     df_final_empenhos.to_excel(os.path.join(BASE_EXEC, f"empenhos.xlsx"), index=False)
@@ -333,9 +369,9 @@ def main():
                 "tipo_mudanca": "REMOVIDA",
                 "dotacao": dotacao,
                 "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
-                "valor_anterior": "-",
-                "valor_novo": "-",
-                "detalhes": "Linha removida"
+                "coluna": "valOrcadoAtualizado",
+                "valor_anterior": 0,
+                "valor_novo": row.get('valOrcadoAtualizado', 0)
             })
 
     # 2. Linhas adicionadas (em final mas não em anterior)
@@ -348,8 +384,9 @@ def main():
                 "tipo_mudanca": "ADICIONADA",
                 "dotacao": dotacao,
                 "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
-                "valor_anterior": "-",
-                "valor_novo": "-"
+                "coluna": "valOrcadoAtualizado",
+                "valor_anterior": 0,
+                "valor_novo": row.get('valOrcadoAtualizado', 0)
             })
 
     # 3. Linhas modificadas (comparar célula por célula)
@@ -401,10 +438,22 @@ def main():
         def get_sigla_from_dotacao(dotacao_str):
             if pd.isna(dotacao_str) or dotacao_str == '':
                 return ''
-            # A dotação tem o formato: orgao.uo.funcao...
+            # A dotação tem o formato: orgao.uo.funcao.subfuncao.programa.proj_ativ...
             try:
-                orgao = dotacao_str.split('.')[0]
-                sigla = lookup_orgao_sigla.get(orgao, '')
+                partes = dotacao_str.split('.')
+                if len(partes) < 6:
+                    return ''
+                orgao = partes[0]
+                proj_ativ = partes[5]  # proj_ativ está na posição 5 (0-indexed)
+                
+                # Tentar primeiro com orgao + proj_ativ
+                chave_completa = f"{orgao}_{proj_ativ}"
+                sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
+                
+                # Se não encontrar, tentar apenas com orgao
+                if not sigla:
+                    sigla = lookup_orgao_sigla.get(orgao, '')
+                    
                 return sigla
             except:
                 return ''
@@ -420,13 +469,12 @@ def main():
             "coluna": "Campo Alterado",
             "valor_anterior": "Valor Anterior",
             "valor_novo": "Valor Atualizado",
-            "detalhes": "Detalhes",
             "data_hora_extracao": "Data/Hora Extração"
         })
         
         # Reordenar colunas: Sigla Órgão como primeira, Valor Atualizado na penúltima, Data/Hora Extração na última
         # Usar apenas as colunas que existem
-        colunas_ordenadas = ['Sigla Órgão', 'Tipo de Mudança', 'Dotação', 'Dotação Exclusiva', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Detalhes', 'Data/Hora Extração']
+        colunas_ordenadas = ['Sigla Órgão', 'Tipo de Mudança', 'Dotação', 'Dotação Exclusiva', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
         colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas.columns]
         # Adicionar qualquer coluna extra que não estava na lista
         colunas_extra = [c for c in df_mudancas.columns if c not in colunas_existentes]
@@ -513,7 +561,9 @@ def main():
                 "codEmpenho": eid,
                 "numProcesso": row.get('codProcesso', ''),
                 "numeroOriginalContrato": row.get('numeroOriginalContrato', ''),
-                "detalhes": "Removido da base atual"
+                "coluna": "valEmpenhadoLiquido",
+                "valor_anterior": 0,
+                "valor_novo": row.get('valEmpenhadoLiquido', 0)
             })
 
     # 2. Linhas adicionadas
@@ -529,7 +579,10 @@ def main():
                 "numProcesso": row.get('codProcesso', ''),
                 "dotacao": row.get('dotacao_completa', ''),
                 "codEmpenho": eid,
-                "numeroOriginalContrato": row.get('numeroOriginalContrato', '')
+                "numeroOriginalContrato": row.get('numeroOriginalContrato', ''),
+                "coluna": "valEmpenhadoLiquido",
+                "valor_anterior": 0,
+                "valor_novo": row.get('valEmpenhadoLiquido', 0)
             })
 
     # 3. Linhas modificadas
@@ -571,17 +624,34 @@ def main():
             df_mudancas_emp['valor_novo'] = df_mudancas_emp['valor_novo'].fillna('-')
         
         # Adicionar sigla do órgão usando lookup
-        def get_sigla_from_dotacao(dotacao_str):
+        def get_sigla_from_dotacao_emp(dotacao_str):
             if pd.isna(dotacao_str) or dotacao_str == '':
                 return ''
-            # A dotação tem o formato: orgao.uo.funcao...
+            # A dotação tem o formato: orgao.uo.funcao.subfuncao.programa.proj_ativ...
+            # Observação: para empenhos a dotação é `dotacao_completa` que é construída diferentemente
             try:
-                orgao = dotacao_str.split('.')[0]
-                return lookup_orgao_sigla.get(orgao, '')
+                partes = dotacao_str.split('.')
+                if len(partes) < 6:
+                    # Se não conseguir extrair proj_ativ, tentar apenas orgao
+                    orgao = partes[0] if len(partes) > 0 else ''
+                    return lookup_orgao_sigla.get(orgao, '')
+                    
+                orgao = partes[0]
+                proj_ativ = partes[5]  # proj_ativ está na posição 5 (0-indexed)
+                
+                # Tentar primeiro com orgao + proj_ativ
+                chave_completa = f"{orgao}_{proj_ativ}"
+                sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
+                
+                # Se não encontrar, tentar apenas com orgao
+                if not sigla:
+                    sigla = lookup_orgao_sigla.get(orgao, '')
+                    
+                return sigla
             except:
                 return ''
         
-        df_mudancas_emp['sigla_orgao'] = df_mudancas_emp['dotacao'].apply(get_sigla_from_dotacao)
+        df_mudancas_emp['sigla_orgao'] = df_mudancas_emp['dotacao'].apply(get_sigla_from_dotacao_emp)
         
         # Renomeia para nomes amigáveis
         df_mudancas_emp = df_mudancas_emp.rename(columns={
@@ -594,12 +664,11 @@ def main():
             "coluna": "Campo Alterado",
             "valor_anterior": "Valor Anterior",
             "valor_novo": "Valor Atualizado",
-            "detalhes": "Detalhes",
             "data_hora_extracao": "Data/Hora Extração"
         })
         
         # Reordenar colunas: Sigla Órgão como primeira coluna, Processo SEI como segunda
-        colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Tipo de Mudança', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Detalhes', 'Data/Hora Extração']
+        colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Tipo de Mudança', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
         colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas_emp.columns]
         colunas_extra = [c for c in df_mudancas_emp.columns if c not in colunas_existentes]
         df_mudancas_emp = df_mudancas_emp[colunas_existentes + colunas_extra]

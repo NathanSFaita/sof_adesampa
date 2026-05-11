@@ -251,7 +251,7 @@ def send_reports_email():
                     Segue anexo os arquivos atualizados contendo a situação das dotações orçamentárias dos contratos de gestão e dos nossos empenhos</p>
                     {tables_content}
                     <p>Atenciosamente,<br>
-                    <img src="cid:signature" style="max-width: 300px; height: auto;">
+                    <img src="cid:signature" style="max-width: 500px; height: auto;">
                     </p>
                 </body>
                 </html>
