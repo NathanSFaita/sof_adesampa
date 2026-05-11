@@ -227,19 +227,17 @@ def build_drive_service():
         return None
 
 def get_file_in_folder(service, file_name, folder_id):
-    # Para Shared Drives, assumindo que folder_id é o ID do drive
+    # Funciona com pastas em qualquer drive (pessoal ou compartilhado)
     try:
         response = service.files().list(
-            q=f"name = '{file_name}' and trashed = false",
-            corpora='drive',
-            driveId=folder_id,
+            q=f"name = '{file_name}' and '{folder_id}' in parents and trashed = false",
             fields="files(id, name)",
             pageSize=1,
             supportsAllDrives=True,
-            includeItemsFromAllDrives=True  # Adicionado
+            includeItemsFromAllDrives=True
         ).execute()
         files = response.get("files", [])
-        print(f"Buscando {file_name} no folder {folder_id}: encontrou {len(files)} arquivos")
+        print(f"Buscando {file_name} na pasta {folder_id}: encontrou {len(files)} arquivos")
         return files[0]["id"] if files else None
     except Exception as e:
         print(f"Erro ao buscar arquivo no Drive ({file_name}): {e}")
