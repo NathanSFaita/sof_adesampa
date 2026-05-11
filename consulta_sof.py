@@ -359,21 +359,6 @@ def main():
     anterior_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in despesas_anterior_reset.iterrows()}
     final_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in df_final_reset.iterrows()}
 
-    # 1. Linhas removidas (em anterior mas não em final)
-    dotacoes_removidas = set(anterior_por_dotacao.keys()) - set(final_por_dotacao.keys())
-    if len(dotacoes_removidas) > 0:
-        print(f"\n❌ {len(dotacoes_removidas)} linhas REMOVIDAS")
-        for dotacao in dotacoes_removidas:
-            row = anterior_por_dotacao[dotacao]
-            mudancas_exec.append({
-                "tipo_mudanca": "REMOVIDA",
-                "dotacao": dotacao,
-                "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
-                "coluna": "valOrcadoAtualizado",
-                "valor_anterior": 0,
-                "valor_novo": row.get('valOrcadoAtualizado', 0)
-            })
-
     # 2. Linhas adicionadas (em final mas não em anterior)
     dotacoes_adicionadas = set(final_por_dotacao.keys()) - set(anterior_por_dotacao.keys())
     if len(dotacoes_adicionadas) > 0:
@@ -546,25 +531,6 @@ def main():
 
     # Criar dataframe para registrar mudanças
     mudancas_emp = []
-
-    # 1. Linhas removidas
-    ids_removidos = set(anterior_emp_dict.keys()) - set(final_emp_dict.keys())
-    print(f"DEBUG: IDs removidos: {len(ids_removidos)}")
-
-    if ids_removidos:
-        print(f"\n❌ {len(ids_removidos)} empenhos REMOVIDOS")
-        for eid in ids_removidos:
-            row = anterior_emp_dict[eid]
-            mudancas_emp.append({
-                "tipo_mudanca": "REMOVIDA",
-                "dotacao": row.get('dotacao_completa', ''),
-                "codEmpenho": eid,
-                "numProcesso": row.get('codProcesso', ''),
-                "numeroOriginalContrato": row.get('numeroOriginalContrato', ''),
-                "coluna": "valEmpenhadoLiquido",
-                "valor_anterior": 0,
-                "valor_novo": row.get('valEmpenhadoLiquido', 0)
-            })
 
     # 2. Linhas adicionadas
     ids_adicionados = set(final_emp_dict.keys()) - set(anterior_emp_dict.keys())
