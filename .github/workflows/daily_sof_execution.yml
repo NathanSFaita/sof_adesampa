@@ -3,7 +3,7 @@ name: Execução Diária SOF
 on:
   schedule:
     # 8 da manhã (horário de Brasília) = 11:00 UTC
-    - cron: '0 11 * * *'
+    - cron: '0 9 * * *'
   workflow_dispatch: # Permite execução manual
 
 jobs:
