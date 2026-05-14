@@ -204,6 +204,36 @@ def main():
     df_final['saldo_dotacao'] = df_final['valDisponivel'] - df_final['valReservadoLiquido']
 
     df_final['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
+
+    colunas_execucao = [
+    "contrato_gestao",
+    "secretaria",
+    "dotacao",
+    "dotacao_exclusiva",
+    "valOrcadoInicial",
+    "valSuplementado",
+    "valReduzido",
+    "valOrcadoAtualizado",
+    "valCongelado",
+    "valDescongelado",
+    "valDisponivel",
+    "valReservado",
+    "valCanceladoReserva",
+    "valReservadoLiquido",
+    "valTotalEmpenhado",
+    "valAnuladoEmpenho",
+    "valEmpenhadoLiquido",
+    "valLiquidado",
+    "valPagoExercicio",
+    "valPagoRestos",
+    "saldo_dotacao",
+    "data_hora_extracao"
+]
+
+    colunas_execucao = [c for c in colunas_execucao if c in df_final.columns]
+    colunas_restantes = [c for c in df_final.columns if c not in colunas_execucao]
+    df_final = df_final[colunas_execucao + colunas_restantes]
+
     df_final.to_excel(os.path.join(BASE_EXEC, f"execucao.xlsx"), index=False)
 
     # Consulta à base de empenhos
