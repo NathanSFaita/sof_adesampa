@@ -70,6 +70,15 @@ def main():
             print(f"Erro na requisição: {e}")
             return None
         
+    # Colunas a serem verificadas para modificações no relatório de execução
+    colunas_mudanca_exec = [
+        "valSuplementado", "valReduzido", "valOrcadoAtualizado"
+    ]
+    # Adicionar 'detalhes' se for uma coluna que pode ser modificada e queira rastrear
+    # colunas_mudanca_exec.append("detalhes") # Exemplo, se 'detalhes' puder mudar e for relevante
+
+
+        
     def normalizar_para_comparacao(df):
         """Normaliza dataframe para comparação consistente de valores"""
         df_norm = df.copy()
@@ -96,9 +105,10 @@ def main():
         if pd.isna(valor) or str(valor).strip() in ['', 'nan', '-', 'None']:
             return valor if valor == '-' else '-'
         try:
-            # Converte para float sem manipulação de string prévia para evitar erros de milhar/decimal
-            num = float(valor)
-            return f"R$ {num:,.2f}".replace(',', '#').replace('.', ',').replace('#', '.')
+            # Tenta converter diretamente para float. Se for string com ',' como decimal, tenta substituir.
+            num = float(str(valor).replace('.', '').replace(',', '.')) if isinstance(valor, str) else float(valor)
+            # Formata para BRL: troca vírgula por ponto para milhares, e ponto por vírgula para decimais
+            return f"R$ {num:,.2f}".replace(',', 'TEMP_COMMA').replace('.', ',').replace('TEMP_COMMA', '.')
         except:
             return str(valor)
         
@@ -395,6 +405,10 @@ def main():
         print(f"\n✅ {len(dotacoes_adicionadas)} linhas ADICIONADAS")
         for dotacao in dotacoes_adicionadas:
             row = final_por_dotacao[dotacao]
+            if not row.get('dotacao_exclusiva'):
+                continue
+            # A coluna 'coluna' para ADICIONADA deve ser o valor de referência, que é 'valOrcadoAtualizado'
+            # O 'valor_anterior' é 0 para uma linha adicionada
             mudancas_exec.append({
                 "tipo_mudanca": "ADICIONADA",
                 "dotacao": dotacao,
@@ -402,6 +416,7 @@ def main():
                 "coluna": "valOrcadoAtualizado",
                 "valor_anterior": 0,
                 "valor_novo": row.get('valOrcadoAtualizado', 0)
+                # "detalhes": "Nova dotação identificada" # Adicionar se quiser um detalhe padrão
             })
 
     # 3. Linhas modificadas (comparar célula por célula)
@@ -411,17 +426,22 @@ def main():
     for dotacao in dotacoes_comuns:
         linha_anterior = anterior_por_dotacao[dotacao]
         linha_final = final_por_dotacao[dotacao]
-        
-        for col in colunas_comuns:
-            if col == "data_hora_extracao":
+
+        if not linha_final.get('dotacao_exclusiva'):
+            continue
+
+        for col in colunas_mudanca_exec: # Usa a lista definida para verificar apenas colunas relevantes
+            if col not in colunas_comuns:
                 continue
-            if linha_anterior[col] != linha_final[col]:
+
+            if linha_anterior.get(col) != linha_final.get(col):
                 linhas_modificadas.append({
                     "dotacao": dotacao,
                     "dotacao_exclusiva": linha_final.get('dotacao_exclusiva', ''),
                     "coluna": col,
-                    "valor_anterior": linha_anterior[col],
-                    "valor_novo": linha_final[col]
+                    "valor_anterior": linha_anterior.get(col),
+                    "valor_novo": linha_final.get(col),
+                    # "detalhes": f"Valor alterado de {linha_anterior.get(col)} para {linha_final.get(col)}" # Adicionar se quiser detalhes
                 })
 
     if len(linhas_modificadas) > 0:
@@ -435,7 +455,8 @@ def main():
                 "dotacao_exclusiva": mudanca['dotacao_exclusiva'],
                 "coluna": mudanca['coluna'],
                 "valor_anterior": mudanca['valor_anterior'],
-                "valor_novo": mudanca['valor_novo']
+                "valor_novo": mudanca['valor_novo'],
+                # "detalhes": f"Valor alterado de {mudanca['valor_anterior']} para {mudanca['valor_novo']}" # Adicionar se quiser detalhes
             })
 
     # Salvar relatório de mudanças
@@ -443,11 +464,12 @@ def main():
         df_mudancas = pd.DataFrame(mudancas_exec)
         df_mudancas['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
         
-        # Preencher NaN em colunas numéricas com valor padrão para linhas sem valores específicos
-        if 'valor_anterior' in df_mudancas.columns:
-            df_mudancas['valor_anterior'] = df_mudancas['valor_anterior'].fillna('-')
-        if 'valor_novo' in df_mudancas.columns:
-            df_mudancas['valor_novo'] = df_mudancas['valor_novo'].fillna('-')
+        # Preencher NaN em colunas de valor com '-' para exibição amigável
+        # Isso é feito APÓS a comparação e antes da formatação BRL
+        if 'valor_anterior' in df_mudancas.columns: # Verifica se a coluna existe
+            df_mudancas['valor_anterior'] = df_mudancas['valor_anterior'].apply(lambda x: '-' if pd.isna(x) else x)
+        if 'valor_novo' in df_mudancas.columns: # Verifica se a coluna existe
+            df_mudancas['valor_novo'] = df_mudancas['valor_novo'].apply(lambda x: '-' if pd.isna(x) else x)
         
         # Adicionar sigla do órgão usando lookup
         def get_sigla_from_dotacao(dotacao_str):
@@ -457,7 +479,10 @@ def main():
             try:
                 partes = dotacao_str.split('.')
                 if len(partes) < 6:
-                    return ''
+                    # Se não conseguir extrair proj_ativ, tentar apenas orgao
+                    orgao = partes[0] if len(partes) > 0 else ''
+                    return lookup_orgao_sigla.get(orgao, '')
+                    
                 orgao = partes[0]
                 proj_ativ = partes[5]  # proj_ativ está na posição 5 (0-indexed)
                 
@@ -478,7 +503,6 @@ def main():
         # Renomeia para nomes amigáveis
         df_mudancas = df_mudancas.rename(columns={
             "sigla_orgao": "Sigla Órgão",
-            "tipo_mudanca": "Tipo de Mudança",
             "dotacao": "Dotação",
             "dotacao_exclusiva": "Dotação Exclusiva",
             "coluna": "Campo Alterado",
@@ -571,14 +595,13 @@ def main():
         for eid in ids_adicionados:
             row = final_emp_dict[eid]
             mudancas_emp.append({
-                "tipo_mudanca": "ADICIONADA",
                 "numProcesso": row.get('codProcesso', ''),
                 "dotacao": row.get('dotacao_completa', ''),
                 "codEmpenho": eid,
                 "numeroOriginalContrato": row.get('numeroOriginalContrato', ''),
                 "coluna": "valEmpenhadoLiquido",
                 "valor_anterior": 0,
-                "valor_novo": row.get('valEmpenhadoLiquido', 0)
+                "valor_novo": row.get('valTotalEmpenhado', 0)
             })
 
     # 3. Linhas modificadas
@@ -590,22 +613,22 @@ def main():
         linha_fin = final_emp_dict[eid]
         
         for col in colunas_comuns_emp:
-            if col in ['codEmpenho', 'dotacao_completa', 'data_hora_extracao']:
+            # Notificar apenas mudanças em colunas de valores (val...)
+            if not col.startswith('val') or col == 'data_hora_extracao':
                 continue
                 
             val_ant = linha_ant.get(col)
             val_fin = linha_fin.get(col)
             
-            if pd.isna(val_ant) != pd.isna(val_fin) or (not pd.isna(val_ant) and val_ant != val_fin):
+            if val_ant != val_fin: # Comparação direta após normalização deve ser suficiente
                 mudancas_emp.append({
-                    "tipo_mudanca": "MODIFICADA",
                     "dotacao": linha_fin.get('dotacao_completa', ''),
                     "codEmpenho": eid,
                     "numProcesso": linha_fin.get('codProcesso', ''),
                     "numeroOriginalContrato": linha_fin.get('numeroOriginalContrato', ''),
                     "coluna": col,
-                    "valor_anterior": str(val_ant),
-                    "valor_novo": str(val_fin)
+                    "valor_anterior": val_ant, # Valores já normalizados
+                    "valor_novo": val_fin, # Valores já normalizados
                 })
 
     # Salvar relatório
@@ -613,11 +636,12 @@ def main():
         df_mudancas_emp = pd.DataFrame(mudancas_emp)
         df_mudancas_emp['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
         
-        # Preencher NaN em colunas numéricas com valor padrão para linhas sem valores específicos
-        if 'valor_anterior' in df_mudancas_emp.columns:
-            df_mudancas_emp['valor_anterior'] = df_mudancas_emp['valor_anterior'].fillna('-')
-        if 'valor_novo' in df_mudancas_emp.columns:
-            df_mudancas_emp['valor_novo'] = df_mudancas_emp['valor_novo'].fillna('-')
+        # Preencher NaN em colunas de valor com '-' para exibição amigável
+        # Isso é feito APÓS a comparação e antes da formatação BRL
+        if 'valor_anterior' in df_mudancas_emp.columns: # Verifica se a coluna existe
+            df_mudancas_emp['valor_anterior'] = df_mudancas_emp['valor_anterior'].apply(lambda x: '-' if pd.isna(x) else x)
+        if 'valor_novo' in df_mudancas_emp.columns: # Verifica se a coluna existe
+            df_mudancas_emp['valor_novo'] = df_mudancas_emp['valor_novo'].apply(lambda x: '-' if pd.isna(x) else x)
         
         # Adicionar sigla do órgão usando lookup
         def get_sigla_from_dotacao_emp(dotacao_str):
@@ -653,7 +677,6 @@ def main():
         df_mudancas_emp = df_mudancas_emp.rename(columns={
             "sigla_orgao": "Sigla Órgão",
             "numProcesso": "Processo SEI",
-            "tipo_mudanca": "Tipo de Mudança",
             "dotacao": "Dotação",
             "codEmpenho": "Código do Empenho",
             "numeroOriginalContrato": "Número do Contrato",
@@ -664,7 +687,7 @@ def main():
         })
         
         # Reordenar colunas: Sigla Órgão como primeira coluna, Processo SEI como segunda
-        colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Tipo de Mudança', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
+        colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
         colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas_emp.columns]
         colunas_extra = [c for c in df_mudancas_emp.columns if c not in colunas_existentes]
         df_mudancas_emp = df_mudancas_emp[colunas_existentes + colunas_extra]

@@ -84,9 +84,10 @@ def formatar_brl_email(valor):
     except:
         return str(valor)
 
-def prepare_html_body(base_exec_path):
+def prepare_html_body(base_exec_path, include_execucao=True, include_empenhos=True):
     """
     Prepara o corpo do e-mail em formato HTML com as tabelas de mudanças.
+    Parametros `include_execucao` e `include_empenhos` controlam quais seções incluir.
     """
     has_changes = False
     today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
@@ -98,7 +99,7 @@ def prepare_html_body(base_exec_path):
 
     # --- Mudanças de Despesas (Execução Orçamentária) ---
     path_mudancas_exec = os.path.join(base_exec_path, "mudancas_execucao.xlsx")
-    if os.path.exists(path_mudancas_exec):
+    if include_execucao and os.path.exists(path_mudancas_exec):
         try:
             df_mudancas_exec = pd.read_excel(path_mudancas_exec)
             if not df_mudancas_exec.empty and 'Data/Hora Extração' in df_mudancas_exec.columns:
@@ -109,7 +110,6 @@ def prepare_html_body(base_exec_path):
                     df_display = df_mudancas_exec.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
                     colunas_ordenadas = [
                         'Sigla Órgão',
-                        'Tipo de Mudança',
                         'Dotação',
                         'Dotação Exclusiva',
                         'Campo Alterado',
@@ -133,11 +133,12 @@ def prepare_html_body(base_exec_path):
         except Exception as e:
             tables_html += f"<p><strong>Despesas (Execução Orçamentária):</strong> Erro ao carregar relatório - {e}</p>"
     else:
-        tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Relatório não encontrado.</p>"
+        if include_execucao:
+            tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Relatório não encontrado.</p>"
 
     # --- Mudanças de Empenhos ---
     path_mudancas_empenhos = os.path.join(base_exec_path, "mudancas_empenhos.xlsx")
-    if os.path.exists(path_mudancas_empenhos):
+    if include_empenhos and os.path.exists(path_mudancas_empenhos):
         try:
             df_mudancas_empenhos = pd.read_excel(path_mudancas_empenhos)
             if not df_mudancas_empenhos.empty and 'Data/Hora Extração' in df_mudancas_empenhos.columns:
@@ -149,7 +150,6 @@ def prepare_html_body(base_exec_path):
                     colunas_ordenadas = [
                         'Sigla Órgão',
                         'Processo SEI',
-                        'Tipo de Mudança',
                         'Dotação',
                         'Código do Empenho',
                         'Número do Contrato',
@@ -174,9 +174,31 @@ def prepare_html_body(base_exec_path):
         except Exception as e:
             tables_html += f"<p><strong>Empenhos:</strong> Erro ao carregar relatório - {e}</p>"
     else:
-        tables_html += "<p><strong>Empenhos:</strong> Relatório não encontrado.</p>"
+        if include_empenhos:
+            tables_html += "<p><strong>Empenhos:</strong> Relatório não encontrado.</p>"
 
     return tables_html, has_changes
+
+
+def get_report_date(file_path):
+    """Retorna a data do relatório no formato dd/mm/AAAA ou None."""
+    if not os.path.exists(file_path):
+        return None
+    try:
+        df = pd.read_excel(file_path)
+        if df.empty or 'Data/Hora Extração' not in df.columns:
+            return None
+        value = df['Data/Hora Extração'].iloc[0]
+        if pd.isna(value):
+            return None
+        try:
+            dt = pd.to_datetime(value)
+            return dt.strftime('%d/%m/%Y')
+        except Exception:
+            return str(value).split(' ')[0]
+    except Exception:
+        return None
+
 
 def attach_file(message, filepath):
     """Anexa um arquivo ao objeto de mensagem de e-mail."""
@@ -297,7 +319,55 @@ def send_reports_email():
         print("ERRO CRÍTICO: Nenhum destinatário válido encontrado. E-mail não será enviado.")
         return
 
-    tables_content, has_changes = prepare_html_body(BASE_EXEC)
+    today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
+    report_files = {
+        "Execução Orçamentária": os.path.join(BASE_EXEC, "mudancas_execucao.xlsx"),
+        "Empenhos": os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx"),
+    }
+    invalid_reports = []
+    valid_report_found = False
+
+    for report_name, report_path in report_files.items():
+        if os.path.exists(report_path):
+            report_date = get_report_date(report_path)
+            if report_date:
+                if report_date != today_str:
+                    invalid_reports.append((report_name, report_date))
+                else:
+                    valid_report_found = True
+            else:
+                invalid_reports.append((report_name, None))
+
+    if invalid_reports:
+        messages = []
+        for report_name, report_date in invalid_reports:
+            if report_date is None:
+                messages.append(f"{report_name} sem data válida")
+            else:
+                messages.append(f"{report_name} com data {report_date}")
+        print(f"Atenção: os seguintes relatório(s) não correspondem à data de execução ({today_str}) e serão ignorados: {'; '.join(messages)}")
+
+    if not valid_report_found:
+        print(f"E-mail não enviado: nenhum relatório com data de execução válida ({today_str}) foi encontrado.")
+        return
+
+    # Determina quais relatórios/arquivos serão enviados e carregados no Drive
+    attachments_to_send = []
+    drive_files_to_upload = []
+    if os.path.exists(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx")):
+        rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx"))
+        if rd == today_str:
+            attachments_to_send.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
+            drive_files_to_upload.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
+    if os.path.exists(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx")):
+        rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx"))
+        if rd == today_str:
+            attachments_to_send.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
+            drive_files_to_upload.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
+
+    include_execucao = os.path.join(BASE_EXEC, "execucao.xlsx") in attachments_to_send
+    include_empenhos = os.path.join(BASE_EXEC, "empenhos.xlsx") in attachments_to_send
+    tables_content, has_changes = prepare_html_body(BASE_EXEC, include_execucao=include_execucao, include_empenhos=include_empenhos)
 
     if not has_changes:
         print("Nenhuma mudança detectada nos arquivos. O e-mail não será enviado.")
@@ -337,17 +407,16 @@ def send_reports_email():
                 signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
                 attach_signature_image(msg, signature_path)
 
-                attach_file(msg, os.path.join(BASE_EXEC, "execucao.xlsx"))
-                attach_file(msg, os.path.join(BASE_EXEC, "empenhos.xlsx"))
+                # Anexa apenas os arquivos cujo relatório de mudanças tem data válida
+                for attachment_path in attachments_to_send:
+                    attach_file(msg, attachment_path)
 
                 server.send_message(msg)
                 print(f"E-mail enviado com sucesso para: {email}")
 
-        # Upload para Google Drive após o envio de e-mail
-        upload_reports_to_drive([
-            os.path.join(BASE_EXEC, "execucao.xlsx"),
-            os.path.join(BASE_EXEC, "empenhos.xlsx"),
-        ])
+        # Upload para Google Drive após o envio de e-mail (apenas arquivos válidos)
+        if drive_files_to_upload:
+            upload_reports_to_drive(drive_files_to_upload)
 
     except smtplib.SMTPAuthenticationError:
         print("ERRO: Falha na autenticação SMTP. Verifique o EMAIL_SENDER e EMAIL_PASSWORD.")
