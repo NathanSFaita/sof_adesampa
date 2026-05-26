@@ -310,13 +310,43 @@ def upload_reports_to_drive(file_paths):
 # --- Função Principal de Envio de E-mail ---
 
 def send_reports_email():
+    def _determine_drive_files():
+        """Retorna lista de arquivos (execucao.xlsx, empenhos.xlsx) que devem ser enviados/atualizados no Drive hoje."""
+        files = []
+        today = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
+        path_exec_mud = os.path.join(BASE_EXEC, "mudancas_execucao.xlsx")
+        path_emp_mud = os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx")
+        # Se existir o arquivo de mudanças e a data de extração for hoje, aponta para o arquivo final correspondente
+        try:
+            if os.path.exists(path_exec_mud) and get_report_date(path_exec_mud) == today:
+                exec_file = os.path.join(BASE_EXEC, "execucao.xlsx")
+                if os.path.exists(exec_file):
+                    files.append(exec_file)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(path_emp_mud) and get_report_date(path_emp_mud) == today:
+                emp_file = os.path.join(BASE_EXEC, "empenhos.xlsx")
+                if os.path.exists(emp_file):
+                    files.append(emp_file)
+        except Exception:
+            pass
+        return files
+
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT]):
         print("ERRO CRÍTICO: Variáveis de ambiente de e-mail não configuradas. Verifique EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT.")
+        # Tenta atualizar o Drive com os arquivos válidos mesmo sem enviar e-mail
+        drive_files = _determine_drive_files()
+        if drive_files:
+            upload_reports_to_drive(drive_files)
         return
 
     recipients_data = get_recipients(EMAILS_FILE)
     if not recipients_data:
         print("ERRO CRÍTICO: Nenhum destinatário válido encontrado. E-mail não será enviado.")
+        drive_files = _determine_drive_files()
+        if drive_files:
+            upload_reports_to_drive(drive_files)
         return
 
     today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
@@ -347,8 +377,24 @@ def send_reports_email():
                 messages.append(f"{report_name} com data {report_date}")
         print(f"Atenção: os seguintes relatório(s) não correspondem à data de execução ({today_str}) e serão ignorados: {'; '.join(messages)}")
 
+    # Determina quais relatórios/arquivos serão enviados e carregados no Drive
+    attachments_to_send = []
+    drive_files_to_upload = []
+    if os.path.exists(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx")):
+        rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx"))
+        if rd == today_str:
+            attachments_to_send.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
+            drive_files_to_upload.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
+    if os.path.exists(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx")):
+        rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx"))
+        if rd == today_str:
+            attachments_to_send.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
+            drive_files_to_upload.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
+
     if not valid_report_found:
         print(f"E-mail não enviado: nenhum relatório com data de execução válida ({today_str}) foi encontrado.")
+        if drive_files_to_upload:
+            upload_reports_to_drive(drive_files_to_upload)
         return
 
     # Determina quais relatórios/arquivos serão enviados e carregados no Drive
@@ -375,53 +421,57 @@ def send_reports_email():
 
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            for recipient in recipients_data:
-                nome = recipient['nome']
-                email = recipient['email']
-                genero = recipient['genero']
+            try:
+                with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                    server.starttls()
+                    server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                    for recipient in recipients_data:
+                        nome = recipient['nome']
+                        email = recipient['email']
+                        genero = recipient['genero']
 
-                saudacao = "Prezada" if genero == "F" else "Prezado"
+                        saudacao = "Prezada" if genero == "F" else "Prezado"
                 
-                msg = MIMEMultipart("alternative")
-                msg['From'] = EMAIL_SENDER
-                msg['To'] = email
-                msg['Subject'] = f"Relatório Atualizado SOF - {datetime.now().strftime('%d/%m/%Y')}"
+                        msg = MIMEMultipart("alternative")
+                        msg['From'] = EMAIL_SENDER
+                        msg['To'] = email
+                        msg['Subject'] = f"Relatório Atualizado SOF - {datetime.now().strftime('%d/%m/%Y')}"
 
-                html_body = f"""
-                <html>
-                <body style="font-family: Arial, sans-serif;">
-                    <p>{saudacao} {nome},</p>
-                    <p>Informo que houveram mudanças na execução orçamentária dos contratos de gestão, conforme está informado nas tabelas abaixo. 
-                    Segue anexo os arquivos atualizados contendo a situação das dotações orçamentárias dos contratos de gestão e dos nossos empenhos</p>
-                    {tables_content}
-                    <p>Atenciosamente,<br>
-                    <img src="cid:signature" style="max-width: 500px; height: auto;">
-                    </p>
-                </body>
-                </html>
-                """
-                msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+                        html_body = f"""
+                        <html>
+                        <body style="font-family: Arial, sans-serif;">
+                            <p>{saudacao} {nome},</p>
+                            <p>Informo que houveram mudanças na execução orçamentária dos contratos de gestão, conforme está informado nas tabelas abaixo. 
+                            Segue anexo os arquivos atualizados contendo a situação das dotações orçamentárias dos contratos de gestão e dos nossos empenhos</p>
+                            {tables_content}
+                            <p>Atenciosamente,<br>
+                            <img src="cid:signature" style="max-width: 500px; height: auto;">
+                            </p>
+                        </body>
+                        </html>
+                        """
+                        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-                signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
-                attach_signature_image(msg, signature_path)
+                        signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
+                        attach_signature_image(msg, signature_path)
 
-                # Anexa apenas os arquivos cujo relatório de mudanças tem data válida
-                for attachment_path in attachments_to_send:
-                    attach_file(msg, attachment_path)
+                        # Anexa apenas os arquivos cujo relatório de mudanças tem data válida
+                        for attachment_path in attachments_to_send:
+                            attach_file(msg, attachment_path)
 
-                server.send_message(msg)
-                print(f"E-mail enviado com sucesso para: {email}")
+                        server.send_message(msg)
+                        print(f"E-mail enviado com sucesso para: {email}")
 
-        # Upload para Google Drive após o envio de e-mail (apenas arquivos válidos)
-        if drive_files_to_upload:
-            upload_reports_to_drive(drive_files_to_upload)
-
-    except smtplib.SMTPAuthenticationError:
-        print("ERRO: Falha na autenticação SMTP. Verifique o EMAIL_SENDER e EMAIL_PASSWORD.")
-    except smtplib.SMTPConnectError as e:
-        print(f"ERRO: Falha ao conectar ao servidor SMTP. Verifique EMAIL_SMTP_SERVER e EMAIL_SMTP_PORT. Detalhes: {e}")
+            except smtplib.SMTPAuthenticationError:
+                print("ERRO: Falha na autenticação SMTP. Verifique o EMAIL_SENDER e EMAIL_PASSWORD.")
+            except smtplib.SMTPConnectError as e:
+                print(f"ERRO: Falha ao conectar ao servidor SMTP. Verifique EMAIL_SMTP_SERVER e EMAIL_SMTP_PORT. Detalhes: {e}")
+            except Exception as e:
+                print(f"ERRO INESPERADO ao enviar e-mail: {e}")
+            finally:
+                # Sempre tente atualizar o Drive com os arquivos válidos do dia, mesmo se o e-mail falhar
+                if 'drive_files_to_upload' in locals() and drive_files_to_upload:
+                    upload_reports_to_drive(drive_files_to_upload)
     except Exception as e:
         print(f"ERRO INESPERADO ao enviar e-mail: {e}")
 
