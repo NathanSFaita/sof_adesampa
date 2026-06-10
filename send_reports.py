@@ -7,13 +7,10 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email import encoders
 from datetime import datetime
-from consulta_sof import input_with_timeout
 import pytz
 
-# Google Drive
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+# Reaproveitando inputs e funções auxiliares unificadas
+from consulta_sof import input_with_timeout, formatar_brl
 
 # Configuração de fuso horário
 tz_brasilia = pytz.timezone('America/Sao_Paulo')
@@ -30,18 +27,10 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")  # Padrão para Gmail
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))  # Padrão para TLS
 
-# --- Variáveis de Ambiente para Google Drive ---
-SERVICE_ACCOUNT_FILE = os.getenv(
-    "GOOGLE_SERVICE_ACCOUNT_JSON",
-    os.path.join(BASE_PATH, "service_account.json")
-)
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-
 if not EMAIL_SENDER:
     print("AVISO: Variável de ambiente EMAIL_SENDER não configurada. Insira manualmente.")
     EMAIL_SENDER = input_with_timeout("Digite o e-mail do remetente (EMAIL_SENDER): ", timeout=30)
     EMAIL_PASSWORD = input_with_timeout("Digite a senha do remetente (EMAIL_PASSWORD): ", timeout=30)
-    DRIVE_FOLDER_ID = input_with_timeout("Digite o ID da pasta do Google Drive para upload (DRIVE_FOLDER_ID): ", timeout=30)
 
 # --- Funções Auxiliares ---
 
@@ -72,114 +61,6 @@ def get_recipients(emails_file_path):
         print(f"Erro ao ler arquivo de e-mails {emails_file_path}: {e}. Nenhum e-mail será enviado.")
         return []
 
-def formatar_brl_email(valor):
-    """Formata um valor numérico para o formato BRL (R$ x.xxx,xx)"""
-    if pd.isna(valor) or valor == '' or valor == 'nan' or valor == '-':
-        return valor if valor == '-' else '-'
-    try:
-        if isinstance(valor, str) and valor.startswith('R$'):
-            return valor
-        num = float(str(valor).replace('.', '').replace(',', '.'))
-        return f"R$ {num:,.2f}".replace(',', '#').replace('.', ',').replace('#', '.')
-    except:
-        return str(valor)
-
-def prepare_html_body(base_exec_path, include_execucao=True, include_empenhos=True):
-    """
-    Prepara o corpo do e-mail em formato HTML com as tabelas de mudanças.
-    Parametros `include_execucao` e `include_empenhos` controlam quais seções incluir.
-    """
-    has_changes = False
-    today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
-    tables_html = ""
-    
-    table_style = 'style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"'
-    th_style = 'style="background-color:#003366;color:white;padding:12px;text-align:left;border:1px solid #ddd;"'
-    td_style = 'style="padding:8px 12px;border:1px solid #ddd;"'
-
-    # --- Mudanças de Despesas (Execução Orçamentária) ---
-    path_mudancas_exec = os.path.join(base_exec_path, "mudancas_execucao.xlsx")
-    if include_execucao and os.path.exists(path_mudancas_exec):
-        try:
-            df_mudancas_exec = pd.read_excel(path_mudancas_exec)
-            if not df_mudancas_exec.empty and 'Data/Hora Extração' in df_mudancas_exec.columns:
-                report_date = str(df_mudancas_exec['Data/Hora Extração'].iloc[0]).split(' ')[0]
-                if report_date == today_str:
-                    has_changes = True
-                    tables_html += "<h3 style='color: #003366;'>📊 Mudanças na Execução Orçamentária dos Contratos de Gestão</h3>"
-                    df_display = df_mudancas_exec.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
-                    colunas_ordenadas = [
-                        'Sigla Órgão',
-                        'Dotação',
-                        'Dotação Exclusiva',
-                        'Campo Alterado',
-                        'Valor Anterior',
-                        'Valor Atualizado',
-                        'Detalhes'
-                    ]
-                    colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
-                    df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
-                    for col in df_display.columns:
-                        if any(x in col.lower() for x in ['valor', 'saldo']):
-                            df_display[col] = df_display[col].apply(formatar_brl_email)
-                    html_table = df_display.to_html(index=False, border=1, escape=False, render_links=False, table_id=None, justify='center', classes=None, header=True, na_rep='')
-                    html_table = html_table.replace('<table', f'<table {table_style}', 1)
-                    html_table = html_table.replace('<th>', f'<th {th_style}>').replace('<td>', f'<td {td_style}>')
-                    tables_html += html_table
-                else:
-                    tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Nenhuma mudança detectada hoje.</p>"
-            else:
-                tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Nenhuma mudança detectada.</p>"
-        except Exception as e:
-            tables_html += f"<p><strong>Despesas (Execução Orçamentária):</strong> Erro ao carregar relatório - {e}</p>"
-    else:
-        if include_execucao:
-            tables_html += "<p><strong>Despesas (Execução Orçamentária):</strong> Relatório não encontrado.</p>"
-
-    # --- Mudanças de Empenhos ---
-    path_mudancas_empenhos = os.path.join(base_exec_path, "mudancas_empenhos.xlsx")
-    if include_empenhos and os.path.exists(path_mudancas_empenhos):
-        try:
-            df_mudancas_empenhos = pd.read_excel(path_mudancas_empenhos)
-            if not df_mudancas_empenhos.empty and 'Data/Hora Extração' in df_mudancas_empenhos.columns:
-                report_date = str(df_mudancas_empenhos['Data/Hora Extração'].iloc[0]).split(' ')[0]
-                if report_date == today_str:
-                    has_changes = True
-                    tables_html += "<h3 style='color: #003366;'>📋 Mudanças nos Empenhos</h3>"
-                    df_display = df_mudancas_empenhos.drop(columns=['Data/Hora Extração'], errors='ignore').copy()
-                    colunas_ordenadas = [
-                        'Sigla Órgão',
-                        'Processo SEI',
-                        'Dotação',
-                        'Código do Empenho',
-                        'Número do Contrato',
-                        'Campo Alterado',
-                        'Valor Anterior',
-                        'Valor Atualizado',
-                        'Detalhes'
-                    ]
-                    colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
-                    df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
-                    for col in df_display.columns:
-                        if any(x in col.lower() for x in ['valor', 'saldo']):
-                            df_display[col] = df_display[col].apply(formatar_brl_email)
-                    html_table = df_display.to_html(index=False, border=1, escape=False, render_links=False, table_id=None, justify='center', classes=None, header=True, na_rep='')
-                    html_table = html_table.replace('<table', f'<table {table_style}', 1)
-                    html_table = html_table.replace('<th>', f'<th {th_style}>').replace('<td>', f'<td {td_style}>')
-                    tables_html += html_table
-                else:
-                    tables_html += "<p><strong>Empenhos:</strong> Nenhuma mudança detectada hoje.</p>"
-            else:
-                tables_html += "<p><strong>Empenhos:</strong> Nenhuma mudança detectada.</p>"
-        except Exception as e:
-            tables_html += f"<p><strong>Empenhos:</strong> Erro ao carregar relatório - {e}</p>"
-    else:
-        if include_empenhos:
-            tables_html += "<p><strong>Empenhos:</strong> Relatório não encontrado.</p>"
-
-    return tables_html, has_changes
-
-
 def get_report_date(file_path):
     """Retorna a data do relatório no formato dd/mm/AAAA ou None."""
     if not os.path.exists(file_path):
@@ -191,14 +72,118 @@ def get_report_date(file_path):
         value = df['Data/Hora Extração'].iloc[0]
         if pd.isna(value):
             return None
+            
+        # Se o pandas já leu como objeto datetime do python/pandas
+        if isinstance(value, pd.Timestamp) or isinstance(value, datetime):
+            return value.strftime('%d/%m/%Y')
+            
+        # Se for string, tentamos converter garantindo que o dia vem primeiro (padrão BR)
+        val_str = str(value).strip()
         try:
-            dt = pd.to_datetime(value)
+            dt = pd.to_datetime(val_str, dayfirst=True)
             return dt.strftime('%d/%m/%Y')
         except Exception:
-            return str(value).split(' ')[0]
-    except Exception:
+            # Fallback: tenta pegar apenas a parte da data caso seja uma string estranha
+            return val_str.split(' ')[0]
+    except Exception as e:
+        print(f"Erro ao ler a data do relatório {file_path}: {e}")
         return None
 
+def prepare_html_body(base_exec_path, include_execucao=True, include_empenhos=True):
+    """
+    Prepara o corpo do e-mail em formato HTML com as tabelas de mudanças.
+    """
+    has_changes = False
+    today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
+    tables_html = ""
+    
+    # NOVOS ESTILOS: Tabela levemente maior (font-size 13px, min-width 800px) e com mais espaçamento
+    table_style = 'style="border-collapse:collapse;width:100%;min-width:800px;font-family:\'Segoe UI\', Arial, sans-serif;font-size:13px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); border-radius: 6px; overflow: hidden;"'
+    th_style = 'style="background-color:#003366;color:white;padding:14px 10px;text-align:center;font-weight:600;letter-spacing:0.5px; border:none;"'
+    td_style = 'style="padding:12px 10px;border-bottom:1px solid #f0f0f0;color:#444444;text-align:center; border-left:none; border-right:none; word-break: break-word;"'
+
+    # --- Mudanças de Despesas (Execução Orçamentária) ---
+    path_mudancas_exec = os.path.join(base_exec_path, "mudancas_execucao.xlsx")
+    if include_execucao and os.path.exists(path_mudancas_exec):
+        try:
+            df_mudancas_exec = pd.read_excel(path_mudancas_exec)
+            if not df_mudancas_exec.empty and 'Data/Hora Extração' in df_mudancas_exec.columns:
+                report_date = get_report_date(path_mudancas_exec)
+                if report_date == today_str:
+                    has_changes = True
+                    # Título mais limpo
+                    tables_html += "<h3 style='color: #003366; padding-bottom: 5px; margin-top: 30px; font-family: Arial, sans-serif; font-size: 16px;'>📊 Mudanças na Execução Orçamentária</h3>"
+                    
+                    # REMOÇÃO DAS COLUNAS: 'Tipo de Mudança' e 'Dotação Exclusiva' e 'Data/Hora'
+                    df_display = df_mudancas_exec.drop(columns=['Data/Hora Extração', 'Tipo de Mudança', 'Dotação Exclusiva'], errors='ignore').copy()
+                    
+                    # Colunas do Relatório reestruturadas
+                    colunas_ordenadas = [
+                        'Sigla Órgão', 'Dotação', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Detalhes'
+                    ]
+                    colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
+                    df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
+                    
+                    for col in df_display.columns:
+                        if any(x in col.lower() for x in ['valor', 'saldo']):
+                            df_display[col] = df_display[col].apply(formatar_brl)
+                            
+                    # border=0 remove as bordas default feias do HTML gerado pelo Pandas
+                    html_table = df_display.to_html(index=False, border=0, escape=False, render_links=False, justify='center', header=True, na_rep='')
+                    html_table = html_table.replace('<table', f'<table {table_style}', 1)
+                    html_table = html_table.replace('<th>', f'<th {th_style}>').replace('<td>', f'<td {td_style}>')
+                    # Wrapper com overflow-x para não estourar o e-mail em telas menores
+                    tables_html += f'<div style="overflow-x: auto; width: 100%;">{html_table}</div>'
+                else:
+                    tables_html += "<p style='color: #666;'><strong>Despesas (Execução Orçamentária):</strong> Nenhuma mudança detectada hoje.</p>"
+            else:
+                tables_html += "<p style='color: #666;'><strong>Despesas (Execução Orçamentária):</strong> Nenhuma mudança detectada.</p>"
+        except Exception as e:
+            tables_html += f"<p style='color: #cc0000;'><strong>Despesas (Execução Orçamentária):</strong> Erro ao carregar relatório - {e}</p>"
+    else:
+        if include_execucao:
+            tables_html += "<p style='color: #666;'><strong>Despesas (Execução Orçamentária):</strong> Relatório não encontrado.</p>"
+
+    # --- Mudanças de Empenhos ---
+    path_mudancas_empenhos = os.path.join(base_exec_path, "mudancas_empenhos.xlsx")
+    if include_empenhos and os.path.exists(path_mudancas_empenhos):
+        try:
+            df_mudancas_empenhos = pd.read_excel(path_mudancas_empenhos)
+            if not df_mudancas_empenhos.empty and 'Data/Hora Extração' in df_mudancas_empenhos.columns:
+                report_date = get_report_date(path_mudancas_empenhos)
+                if report_date == today_str:
+                    has_changes = True
+                    tables_html += "<h3 style='color: #003366; padding-bottom: 5px; margin-top: 40px; font-family: Arial, sans-serif; font-size: 16px;'>📋 Mudanças nos Empenhos</h3>"
+                    # Remoção das colunas desnecessárias (Código do Empenho e Número do Contrato ocultados)
+                    df_display = df_mudancas_empenhos.drop(columns=['Data/Hora Extração', 'Detalhes', 'Código do Empenho', 'Número do Contrato'], errors='ignore').copy()
+                    
+                    # Colunas reordenadas sem Código do Empenho e Número do Contrato
+                    colunas_ordenadas = [
+                        'Sigla Órgão', 'Processo SEI', 'Dotação', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado'
+                    ]
+                    colunas_existentes = [c for c in colunas_ordenadas if c in df_display.columns]
+                    df_display = df_display[colunas_existentes + [c for c in df_display.columns if c not in colunas_existentes]]
+                    
+                    for col in df_display.columns:
+                        if any(x in col.lower() for x in ['valor', 'saldo']):
+                            df_display[col] = df_display[col].apply(formatar_brl)
+                            
+                    html_table = df_display.to_html(index=False, border=0, escape=False, render_links=False, justify='center', header=True, na_rep='')
+                    html_table = html_table.replace('<table', f'<table {table_style}', 1)
+                    html_table = html_table.replace('<th>', f'<th {th_style}>').replace('<td>', f'<td {td_style}>')
+                    # Wrapper com overflow-x para não estourar o e-mail em telas menores
+                    tables_html += f'<div style="overflow-x: auto; width: 100%;">{html_table}</div>'
+                else:
+                    tables_html += "<p style='color: #666;'><strong>Empenhos:</strong> Nenhuma mudança detectada hoje.</p>"
+            else:
+                tables_html += "<p style='color: #666;'><strong>Empenhos:</strong> Nenhuma mudança detectada.</p>"
+        except Exception as e:
+            tables_html += f"<p style='color: #cc0000;'><strong>Empenhos:</strong> Erro ao carregar relatório - {e}</p>"
+    else:
+        if include_empenhos:
+            tables_html += "<p style='color: #666;'><strong>Empenhos:</strong> Relatório não encontrado.</p>"
+
+    return tables_html, has_changes
 
 def attach_file(message, filepath):
     """Anexa um arquivo ao objeto de mensagem de e-mail."""
@@ -234,119 +219,16 @@ def attach_signature_image(message, image_path):
         print(f"Erro ao anexar imagem de assinatura {image_path}: {e}")
         return False
 
-# --- Google Drive ---   
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-
-def build_drive_service():
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        print(f"Erro: serviço de conta Google não encontrado em {SERVICE_ACCOUNT_FILE}")
-        return None
-    try:
-        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        return build("drive", "v3", credentials=creds)
-    except Exception as e:
-        print(f"Erro ao criar serviço do Google Drive: {e}")
-        return None
-
-def get_file_in_folder(service, file_name, folder_id):
-    # Funciona com pastas em qualquer drive (pessoal ou compartilhado)
-    try:
-        response = service.files().list(
-            q=f"name = '{file_name}' and '{folder_id}' in parents and trashed = false",
-            fields="files(id, name)",
-            pageSize=1,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        files = response.get("files", [])
-        print(f"Buscando {file_name} na pasta {folder_id}: encontrou {len(files)} arquivos")
-        return files[0]["id"] if files else None
-    except Exception as e:
-        print(f"Erro ao buscar arquivo no Drive ({file_name}): {e}")
-        return None
-
-def upload_or_update_file(service, file_path, folder_id):
-    if not os.path.exists(file_path):
-        print(f"Aviso: arquivo não existe para upload no Drive: {file_path}")
-        return None
-    file_name = os.path.basename(file_path)
-    try:
-        existing_file_id = get_file_in_folder(service, file_name, folder_id)
-        media = MediaFileUpload(file_path, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        if existing_file_id:
-            try:
-                service.files().update(fileId=existing_file_id, media_body=media, supportsAllDrives=True).execute()
-                print(f"Arquivo atualizado no Google Drive: {file_name}")
-                return existing_file_id
-            except Exception as update_error:
-                if "404" in str(update_error) or "notFound" in str(update_error):
-                    print(f"Arquivo {file_name} não encontrado para update, criando novo...")
-                    metadata = {"name": file_name, "parents": [folder_id]}
-                    created = service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
-                    print(f"Arquivo criado no Google Drive: {file_name}")
-                    return created.get("id")
-                else:
-                    print(f"Erro ao atualizar arquivo no Google Drive ({file_name}): {update_error}")
-                    return None
-        else:
-            metadata = {"name": file_name, "parents": [folder_id]}
-            created = service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
-            print(f"Arquivo criado no Google Drive: {file_name}")
-            return created.get("id")
-    except Exception as e:
-        print(f"Erro ao enviar arquivo para o Google Drive ({file_name}): {e}")
-        return None
-
-def upload_reports_to_drive(file_paths):
-    if not DRIVE_FOLDER_ID:
-        print("Drive não configurado: variável de ambiente DRIVE_FOLDER_ID ausente.")
-        return
-    service = build_drive_service()
-    if not service:
-        return
-    for path in file_paths:
-        upload_or_update_file(service, path, DRIVE_FOLDER_ID)
-
 # --- Função Principal de Envio de E-mail ---
 
 def send_reports_email():
-    def _determine_drive_files():
-        """Retorna lista de arquivos (execucao.xlsx, empenhos.xlsx) que devem ser enviados/atualizados no Drive hoje."""
-        files = []
-        today = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
-        path_exec_mud = os.path.join(BASE_EXEC, "mudancas_execucao.xlsx")
-        path_emp_mud = os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx")
-        # Se existir o arquivo de mudanças e a data de extração for hoje, aponta para o arquivo final correspondente
-        try:
-            if os.path.exists(path_exec_mud) and get_report_date(path_exec_mud) == today:
-                exec_file = os.path.join(BASE_EXEC, "execucao.xlsx")
-                if os.path.exists(exec_file):
-                    files.append(exec_file)
-        except Exception:
-            pass
-        try:
-            if os.path.exists(path_emp_mud) and get_report_date(path_emp_mud) == today:
-                emp_file = os.path.join(BASE_EXEC, "empenhos.xlsx")
-                if os.path.exists(emp_file):
-                    files.append(emp_file)
-        except Exception:
-            pass
-        return files
-
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT]):
-        print("ERRO CRÍTICO: Variáveis de ambiente de e-mail não configuradas. Verifique EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT.")
-        # Tenta atualizar o Drive com os arquivos válidos mesmo sem enviar e-mail
-        drive_files = _determine_drive_files()
-        if drive_files:
-            upload_reports_to_drive(drive_files)
+        print("ERRO CRÍTICO: Variáveis de ambiente de e-mail não configuradas. Verifique EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT.")
         return
 
     recipients_data = get_recipients(EMAILS_FILE)
     if not recipients_data:
         print("ERRO CRÍTICO: Nenhum destinatário válido encontrado. E-mail não será enviado.")
-        drive_files = _determine_drive_files()
-        if drive_files:
-            upload_reports_to_drive(drive_files)
         return
 
     today_str = datetime.now(tz_brasilia).strftime('%d/%m/%Y')
@@ -377,39 +259,20 @@ def send_reports_email():
                 messages.append(f"{report_name} com data {report_date}")
         print(f"Atenção: os seguintes relatório(s) não correspondem à data de execução ({today_str}) e serão ignorados: {'; '.join(messages)}")
 
-    # Determina quais relatórios/arquivos serão enviados e carregados no Drive
     attachments_to_send = []
-    drive_files_to_upload = []
     if os.path.exists(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx")):
         rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx"))
         if rd == today_str:
             attachments_to_send.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
-            drive_files_to_upload.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
+            
     if os.path.exists(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx")):
         rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx"))
         if rd == today_str:
             attachments_to_send.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
-            drive_files_to_upload.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
 
     if not valid_report_found:
         print(f"E-mail não enviado: nenhum relatório com data de execução válida ({today_str}) foi encontrado.")
-        if drive_files_to_upload:
-            upload_reports_to_drive(drive_files_to_upload)
         return
-
-    # Determina quais relatórios/arquivos serão enviados e carregados no Drive
-    attachments_to_send = []
-    drive_files_to_upload = []
-    if os.path.exists(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx")):
-        rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx"))
-        if rd == today_str:
-            attachments_to_send.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
-            drive_files_to_upload.append(os.path.join(BASE_EXEC, "execucao.xlsx"))
-    if os.path.exists(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx")):
-        rd = get_report_date(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx"))
-        if rd == today_str:
-            attachments_to_send.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
-            drive_files_to_upload.append(os.path.join(BASE_EXEC, "empenhos.xlsx"))
 
     include_execucao = os.path.join(BASE_EXEC, "execucao.xlsx") in attachments_to_send
     include_empenhos = os.path.join(BASE_EXEC, "empenhos.xlsx") in attachments_to_send
@@ -421,57 +284,76 @@ def send_reports_email():
 
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            try:
-                with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-                    server.starttls()
-                    server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-                    for recipient in recipients_data:
-                        nome = recipient['nome']
-                        email = recipient['email']
-                        genero = recipient['genero']
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            
+            for recipient in recipients_data:
+                nome = recipient['nome']
+                email = recipient['email']
+                genero = recipient['genero']
 
-                        saudacao = "Prezada" if genero == "F" else "Prezado"
-                
-                        msg = MIMEMultipart("alternative")
-                        msg['From'] = EMAIL_SENDER
-                        msg['To'] = email
-                        msg['Subject'] = f"Relatório Atualizado SOF - {datetime.now().strftime('%d/%m/%Y')}"
+                saudacao = "Prezada" if genero == "F" else "Prezado"
+        
+                msg = MIMEMultipart("alternative")
+                msg['From'] = EMAIL_SENDER
+                msg['To'] = email
+                msg['Subject'] = f"Relatório Atualizado SOF - {datetime.now().strftime('%d/%m/%Y')}"
 
-                        html_body = f"""
-                        <html>
-                        <body style="font-family: Arial, sans-serif;">
-                            <p>{saudacao} {nome},</p>
-                            <p>Informo que houveram mudanças na execução orçamentária dos contratos de gestão, conforme está informado nas tabelas abaixo. 
-                            Segue anexo os arquivos atualizados contendo a situação das dotações orçamentárias dos contratos de gestão e dos nossos empenhos</p>
-                            {tables_content}
-                            <p>Atenciosamente,<br>
-                            <img src="cid:signature" style="max-width: 500px; height: auto;">
+                # NOVO LAYOUT DE E-MAIL (max-width expandido para 1100px para caber as tabelas com conforto e levemente maiores)
+                html_body = f"""
+                <html>
+                <body style="margin: 0; padding: 0; background-color: #f4f7f6; font-family: 'Segoe UI', Arial, sans-serif; color: #333333;">
+                    <div style="max-width: 1100px; margin: 30px auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
+                        
+                        <!-- Cabeçalho -->
+                        <div style="background-color: #003366; padding: 25px; text-align: center;">
+                            <h2 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: normal; letter-spacing: 0.5px;">Relatório de Atualização - SOF</h2>
+                        </div>
+                        
+                        <!-- Corpo Principal -->
+                        <div style="padding: 35px;">
+                            <p style="font-size: 16px; margin-top: 0;">{saudacao} <strong>{nome}</strong>,</p>
+                            
+                            <p style="line-height: 1.6; font-size: 15px;">
+                                Informamos que <strong>houve mudanças</strong> na execução orçamentária dos contratos de gestão na data de hoje.
                             </p>
-                        </body>
-                        </html>
-                        """
-                        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+                            <p style="line-height: 1.6; font-size: 15px;">
+                                <strong>Seguem anexos</strong> os arquivos atualizados contendo a situação detalhada das dotações orçamentárias e dos nossos empenhos. Abaixo, destacamos as alterações detectadas pelo sistema:
+                            </p>
+                            
+                            <!-- Bloco de Tabelas -->
+                            <div style="margin-top: 35px; margin-bottom: 35px; width: 100%;">
+                                {tables_content}
+                            </div>
+                            
+                            <!-- Rodapé -->
+                            <div style="border-top: 1px solid #eeeeee; padding-top: 25px; margin-top: 40px;">
+                                <p style="line-height: 1.6; font-size: 14px; color: #666666; margin-bottom: 25px;">
+                                    Este é um e-mail automático. Em caso de dúvidas, a equipe está à disposição.
+                                </p>
+                                <p style="line-height: 1.6; font-size: 15px; margin-bottom: 5px;">Atenciosamente,</p>
+                                <img src="cid:signature" style="max-width: 250px; height: auto; display: block; margin-top: 10px;">
+                            </div>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+                msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-                        signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
-                        attach_signature_image(msg, signature_path)
+                signature_path = os.path.join(AUX_FILES_PATH, "assinatura.png")
+                attach_signature_image(msg, signature_path)
 
-                        # Anexa apenas os arquivos cujo relatório de mudanças tem data válida
-                        for attachment_path in attachments_to_send:
-                            attach_file(msg, attachment_path)
+                for attachment_path in attachments_to_send:
+                    attach_file(msg, attachment_path)
 
-                        server.send_message(msg)
-                        print(f"E-mail enviado com sucesso para: {email}")
+                server.send_message(msg)
+                print(f"E-mail enviado com sucesso para: {email}")
 
-            except smtplib.SMTPAuthenticationError:
-                print("ERRO: Falha na autenticação SMTP. Verifique o EMAIL_SENDER e EMAIL_PASSWORD.")
-            except smtplib.SMTPConnectError as e:
-                print(f"ERRO: Falha ao conectar ao servidor SMTP. Verifique EMAIL_SMTP_SERVER e EMAIL_SMTP_PORT. Detalhes: {e}")
-            except Exception as e:
-                print(f"ERRO INESPERADO ao enviar e-mail: {e}")
-            finally:
-                # Sempre tente atualizar o Drive com os arquivos válidos do dia, mesmo se o e-mail falhar
-                if 'drive_files_to_upload' in locals() and drive_files_to_upload:
-                    upload_reports_to_drive(drive_files_to_upload)
+    except smtplib.SMTPAuthenticationError:
+        print("ERRO: Falha na autenticação SMTP. Verifique o EMAIL_SENDER e EMAIL_PASSWORD.")
+    except smtplib.SMTPConnectError as e:
+        print(f"ERRO: Falha ao conectar ao servidor SMTP. Verifique SMTP_SERVER e SMTP_PORT. Detalhes: {e}")
     except Exception as e:
         print(f"ERRO INESPERADO ao enviar e-mail: {e}")
 

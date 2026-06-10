@@ -7,18 +7,24 @@ from datetime import datetime, timedelta, timezone
 import threading
 import pytz
 
-# Configurações iniciais
+# Google Drive API
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
+# Configurações iniciais
 tz_brasilia = pytz.timezone('America/Sao_Paulo')
 dt_inicio = datetime.fromtimestamp(time.time(), tz=tz_brasilia)
 ano = str(dt_inicio.year)
 mes = str(dt_inicio.month).zfill(2)
 dia = str(dt_inicio.day).zfill(2)
 
-print(dt_inicio)
+print(f"Iniciando rotina em: {dt_inicio.strftime('%d/%m/%Y %H:%M:%S')}")
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 BASE_EXEC = os.path.join(BASE_PATH, "base_execucao")
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 def input_with_timeout(prompt, timeout=15):
     """Solicita input do usuário com um tempo limite."""
@@ -39,8 +45,78 @@ def input_with_timeout(prompt, timeout=15):
         return None
     return result[0]
 
-def main():
+def formatar_brl(valor):
+    """Formata um valor numérico para o formato BRL (R$ x.xxx,xx)"""
+    if pd.isna(valor) or str(valor).strip() in ['', 'nan', '-', 'None']:
+        return valor if valor == '-' else '-'
+    try:
+        if isinstance(valor, str) and valor.startswith('R$'):
+            return valor
+        num = float(str(valor).replace('.', '').replace(',', '.')) if isinstance(valor, str) else float(valor)
+        return f"R$ {num:,.2f}".replace(',', 'TEMP_COMMA').replace('.', ',').replace('TEMP_COMMA', '.')
+    except:
+        return str(valor)
 
+# --- Funções Auxiliares do Google Drive ---
+
+def build_drive_service(service_account_file):
+    if not os.path.exists(service_account_file):
+        print(f"Erro: serviço de conta Google não encontrado em {service_account_file}")
+        return None
+    try:
+        creds = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        print(f"Erro ao criar serviço do Google Drive: {e}")
+        return None
+
+def get_file_in_folder(service, file_name, folder_id):
+    try:
+        response = service.files().list(
+            q=f"name = '{file_name}' and '{folder_id}' in parents and trashed = false",
+            fields="files(id, name)",
+            pageSize=1,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        files = response.get("files", [])
+        return files[0]["id"] if files else None
+    except Exception as e:
+        print(f"Erro ao buscar arquivo no Drive ({file_name}): {e}")
+        return None
+
+def upload_or_update_file(service, file_path, folder_id):
+    if not os.path.exists(file_path):
+        print(f"Aviso: arquivo não existe para upload no Drive: {file_path}")
+        return None
+    file_name = os.path.basename(file_path)
+    try:
+        existing_file_id = get_file_in_folder(service, file_name, folder_id)
+        media = MediaFileUpload(file_path, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if existing_file_id:
+            try:
+                service.files().update(fileId=existing_file_id, media_body=media, supportsAllDrives=True).execute()
+                print(f"Arquivo atualizado no Google Drive: {file_name}")
+                return existing_file_id
+            except Exception as update_error:
+                if "404" in str(update_error) or "notFound" in str(update_error):
+                    metadata = {"name": file_name, "parents": [folder_id]}
+                    created = service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
+                    print(f"Arquivo criado no Google Drive: {file_name}")
+                    return created.get("id")
+                else:
+                    print(f"Erro ao atualizar arquivo no Google Drive ({file_name}): {update_error}")
+                    return None
+        else:
+            metadata = {"name": file_name, "parents": [folder_id]}
+            created = service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
+            print(f"Arquivo criado no Google Drive: {file_name}")
+            return created.get("id")
+    except Exception as e:
+        print(f"Erro ao enviar arquivo para o Google Drive ({file_name}): {e}")
+        return None
+
+def main():
     TOKEN = os.getenv("API_TOKEN_SF")
     if not TOKEN:
         TOKEN = input_with_timeout("API_TOKEN_SF não encontrado. Digite o Token")
@@ -49,40 +125,36 @@ def main():
         print("ERRO CRÍTICO: Token não fornecido.")
         sys.exit(1)
 
-    print("TOKEN carregado?", bool(TOKEN))
-    print("Primeiros 6 chars do token:", TOKEN[:6])
+    # Configurações do Google Drive
+    SERVICE_ACCOUNT_FILE = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        os.path.join(BASE_PATH, "service_account.json")
+    )
+    DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    if not DRIVE_FOLDER_ID:
+        DRIVE_FOLDER_ID = input_with_timeout("Digite o ID da pasta do Google Drive para upload (DRIVE_FOLDER_ID): ", timeout=30)
 
     def fazer_requisicao(endpoint, params=None, token=None):
         BASE_URL = "https://gateway.apilib.prefeitura.sp.gov.br/sf/sof/v4/"
         url = f"{BASE_URL}{endpoint}"
         headers = {
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json"
-    }
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json"
+        }
         try:
             response = requests.get(url, headers=headers, params=params, timeout=60)
             response.raise_for_status()
-
             print(f"Requisição para {endpoint} com params {params} retornou status {response.status_code}")     
             return response.json()
-        
         except requests.exceptions.RequestException as e:
-            print(f"Erro na requisição: {e}")
+            print(f"Erro na requisição ({endpoint}): {e}")
             return None
-        
-    # Colunas a serem verificadas para modificações no relatório de execução
-    colunas_mudanca_exec = [
-        "valSuplementado", "valReduzido", "valOrcadoAtualizado"
-    ]
-    # Adicionar 'detalhes' se for uma coluna que pode ser modificada e queira rastrear
-    # colunas_mudanca_exec.append("detalhes") # Exemplo, se 'detalhes' puder mudar e for relevante
-
-
         
     def normalizar_para_comparacao(df):
         """Normaliza dataframe para comparação consistente de valores"""
+        if df.empty:
+            return df.copy()
         df_norm = df.copy()
-        # Colunas que NUNCA devem ser tratadas como números para evitar zeros indevidos ou aglutinações
         cols_texto = ['dotacao', 'codEmpenho', 'codProcesso', 'dotacao_completa', 'numeroOriginalContrato', 'Processo SEI']
         
         for col in df_norm.columns:
@@ -90,48 +162,28 @@ def main():
                 df_norm[col] = df_norm[col].astype(str).replace(['nan', 'None', '<NA>'], '').str.strip()
                 continue
                 
-            # Tentar converter para numérico
             coerced = pd.to_numeric(df_norm[col], errors='coerce')
             if pd.api.types.is_numeric_dtype(coerced) and not coerced.isnull().all():
-                # Arredondamento fixo para evitar diferenças infinitesimais de float
                 df_norm[col] = coerced.fillna(0).round(2)
             else:
                 df_norm[col] = df_norm[col].astype(str).replace(['nan', 'None', '<NA>'], '').str.strip()
                 df_norm[col] = df_norm[col].replace('', None)
         return df_norm
-    
-    def formatar_brl(valor):
-        """Formata um valor numérico para o formato BRL (R$ x.xxx,xx)"""
-        if pd.isna(valor) or str(valor).strip() in ['', 'nan', '-', 'None']:
-            return valor if valor == '-' else '-'
-        try:
-            # Tenta converter diretamente para float. Se for string com ',' como decimal, tenta substituir.
-            num = float(str(valor).replace('.', '').replace(',', '.')) if isinstance(valor, str) else float(valor)
-            # Formata para BRL: troca vírgula por ponto para milhares, e ponto por vírgula para decimais
-            return f"R$ {num:,.2f}".replace(',', 'TEMP_COMMA').replace('.', ',').replace('TEMP_COMMA', '.')
-        except:
-            return str(valor)
-        
-    # Consulta à base de despesas
 
-    despesas_anterior = pd.read_excel(os.path.join(BASE_PATH, "base_execucao", "execucao.xlsx"))
+    # -------------------------------------------------------------
+    # 1. CONSULTA DE DESPESAS (EXECUÇÃO ORÇAMENTÁRIA)
+    # -------------------------------------------------------------
+    try:
+        despesas_anterior = pd.read_excel(os.path.join(BASE_PATH, "base_execucao", "execucao.xlsx"))
+    except FileNotFoundError:
+        despesas_anterior = pd.DataFrame()
 
     params_dp = {
-        "anoDotacao": ano,
-        "mesDotacao": mes,
-        "codOrgao": "",
-        "codUnidade": "",
-        "codFuncao": "",
-        "codSubFuncao": "",
-        "codPrograma": "",
-        "codProjetoAtividade": "",
-        "codCategoria": "",
-        "codGrupo": "", 
-        "codModalidade": "",
-        "codElemento": "",
-        "codFonteRecurso": "",
-        "codVinculacaoRecurso": "",  
-        }    
+        "anoDotacao": ano, "mesDotacao": mes, "codOrgao": "", "codUnidade": "",
+        "codFuncao": "", "codSubFuncao": "", "codPrograma": "", "codProjetoAtividade": "",
+        "codCategoria": "", "codGrupo": "", "codModalidade": "", "codElemento": "",
+        "codFonteRecurso": "", "codVinculacaoRecurso": "",  
+    }    
         
     colunas_iniciais = ["contrato_gestao", "secretaria", "dotacao", "dotacao_exclusiva"]
 
@@ -141,19 +193,14 @@ def main():
         print("Erro: Arquivo dotacoes.xlsx não encontrado.")
         sys.exit(1)
 
-    # Criar dicionário de lookup: (orgao, proj_ativ) -> contrato_gestao (sigla)
-    # Também mantém lookup por orgao apenas para casos onde proj_ativ não está disponível
     lookup_orgao_proj_ativ_sigla = {}
-    lookup_orgao_sigla = {}  # fallback para quando proj_ativ não estiver disponível
+    lookup_orgao_sigla = {}
     
     for _, row in df_dotacoes.iterrows():
         orgao = str(row['orgao'])
         proj_ativ = str(row['proj_ativ'])
         sigla = str(row['contrato_gestao'])
-        # Lookup com proj_ativ como primeira tentativa
-        chave_completa = f"{orgao}_{proj_ativ}"
-        lookup_orgao_proj_ativ_sigla[chave_completa] = sigla
-        # Fallback: apenas orgao (será sobrescrito se houver múltiplas entradas)
+        lookup_orgao_proj_ativ_sigla[f"{orgao}_{proj_ativ}"] = sigla
         lookup_orgao_sigla[orgao] = sigla
 
     list_df_despesas = []
@@ -176,28 +223,20 @@ def main():
 
         dotacao = f"{orgao}.{uo}.{funcao}.{subfuncao}.{programa}.{proj_ativ}.{despesa}.{fonte}.{referencia}.{destinacao}.{vinculacao}"
 
-        params_dp["codOrgao"] = orgao
-        params_dp["codUnidade"] = uo
-        params_dp["codFuncao"] = funcao
-        params_dp["codSubFuncao"] = subfuncao
-        params_dp["codPrograma"] = programa
-        params_dp["codProjetoAtividade"] = proj_ativ
-        params_dp["codCategoria"] = str(row["categoria"])
-        params_dp["codGrupo"] = str(row["grupo"])
-        params_dp["codModalidade"] = str(row["modalidade"])
-        params_dp["codElemento"] = str(row["elemento"])
-        params_dp["codFonteRecurso"] = fonte
-        params_dp["codVinculacaoRecurso"] = vinculacao
+        params_dp.update({
+            "codOrgao": orgao, "codUnidade": uo, "codFuncao": funcao, "codSubFuncao": subfuncao,
+            "codPrograma": programa, "codProjetoAtividade": proj_ativ, "codCategoria": str(row["categoria"]),
+            "codGrupo": str(row["grupo"]), "codModalidade": str(row["modalidade"]),
+            "codElemento": str(row["elemento"]), "codFonteRecurso": fonte, "codVinculacaoRecurso": vinculacao
+        })
 
         resposta = fazer_requisicao("despesas", params=params_dp, token=TOKEN)
         if resposta is None or "lstDespesas" not in resposta:
-            print(f"⚠️ Resposta inválida para dotação {dotacao}")
+            print(f"⚠️ Resposta inválida/vazia para dotação {dotacao}")
             continue
         else:
             print(f"✅ Dotação {dotacao} - Despesas encontradas: {len(resposta['lstDespesas'])}")
-
             df_despesas = pd.json_normalize(resposta["lstDespesas"])
-            # Excluir colunas desnecessárias da API
             df_despesas = df_despesas.drop(columns=['modifiedMode', 'usuarioOperacao'], errors='ignore')
             df_despesas["contrato_gestao"] = contrato_gestao
             df_despesas["secretaria"] = secretaria
@@ -205,50 +244,32 @@ def main():
             df_despesas["dotacao_exclusiva"] = dotacao_exclusiva
             list_df_despesas.append(df_despesas)
         
-    if list_df_despesas:
-        df_final = pd.concat(list_df_despesas, ignore_index=True)
+    df_final = pd.concat(list_df_despesas, ignore_index=True) if list_df_despesas else pd.DataFrame(columns=colunas_iniciais)
+
+    sucesso_execucao = not df_final.empty
+
+    if sucesso_execucao:
+        df_final['saldo_dotacao'] = df_final['valDisponivel'] - df_final['valReservadoLiquido']
+        df_final['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
+
+        colunas_execucao = [
+            "contrato_gestao", "secretaria", "dotacao", "dotacao_exclusiva", "valOrcadoInicial",
+            "valSuplementado", "valReduzido", "valOrcadoAtualizado", "valCongelado", "valDescongelado",
+            "valDisponivel", "valReservado", "valCanceladoReserva", "valReservadoLiquido", "valTotalEmpenhado",
+            "valAnuladoEmpenho", "valEmpenhadoLiquido", "valLiquidado", "valPagoExercicio", "valPagoRestos",
+            "saldo_dotacao", "data_hora_extracao"
+        ]
+
+        colunas_execucao = [c for c in colunas_execucao if c in df_final.columns]
+        colunas_restantes = [c for c in df_final.columns if c not in colunas_execucao]
+        df_final = df_final[colunas_execucao + colunas_restantes]
+        df_final.to_excel(os.path.join(BASE_EXEC, "execucao.xlsx"), index=False)
     else:
-        df_final = pd.DataFrame(columns=colunas_iniciais)
+        print("\n⚠️ AVISO CRÍTICO: A API não retornou dados de despesas. O arquivo local não será sobrescrito para proteger a base histórica.")
 
-    # Calcular saldo da dotação
-    df_final['saldo_dotacao'] = df_final['valDisponivel'] - df_final['valReservadoLiquido']
-
-    df_final['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
-
-    colunas_execucao = [
-    "contrato_gestao",
-    "secretaria",
-    "dotacao",
-    "dotacao_exclusiva",
-    "valOrcadoInicial",
-    "valSuplementado",
-    "valReduzido",
-    "valOrcadoAtualizado",
-    "valCongelado",
-    "valDescongelado",
-    "valDisponivel",
-    "valReservado",
-    "valCanceladoReserva",
-    "valReservadoLiquido",
-    "valTotalEmpenhado",
-    "valAnuladoEmpenho",
-    "valEmpenhadoLiquido",
-    "valLiquidado",
-    "valPagoExercicio",
-    "valPagoRestos",
-    "saldo_dotacao",
-    "data_hora_extracao"
-]
-
-    colunas_execucao = [c for c in colunas_execucao if c in df_final.columns]
-    colunas_restantes = [c for c in df_final.columns if c not in colunas_execucao]
-    df_final = df_final[colunas_execucao + colunas_restantes]
-
-    df_final.to_excel(os.path.join(BASE_EXEC, f"execucao.xlsx"), index=False)
-
-    # Consulta à base de empenhos
-
-    # 1. Leia a base antiga ANTES de salvar o novo arquivo
+    # -------------------------------------------------------------
+    # 2. CONSULTA DE EMPENHOS
+    # -------------------------------------------------------------
     try:
         empenhos_anterior = pd.read_excel(os.path.join(BASE_PATH, "base_execucao", "empenhos.xlsx"))
     except FileNotFoundError:
@@ -262,12 +283,7 @@ def main():
         print("ERRO: CNPJ_ADESAMPA não configurado.")
         sys.exit(1)
 
-    params_empenhos = {
-        "anoEmpenho": ano,
-        "mesEmpenho": mes,
-        "numCpfCnpj": CNPJ,
-        "numPagina": 1
-    }
+    params_empenhos = {"anoEmpenho": ano, "mesEmpenho": mes, "numCpfCnpj": CNPJ, "numPagina": 1}
 
     def col_str(df, col):   
         series = df[col].astype("string").fillna("")
@@ -299,8 +315,7 @@ def main():
         return {}
 
     list_empenhos = []
-    df_final_empenhos = pd.DataFrame()
-
+    
     for pagina in range(1, total_paginas + 1):
         params_empenhos["numPagina"] = pagina
         resposta_empenhos = fazer_requisicao("empenhos", params=params_empenhos, token=TOKEN)
@@ -312,35 +327,19 @@ def main():
             continue
 
         df_empenhos["dotacao_completa"] = (
-            col_str(df_empenhos, "codOrgao")+ "." +
-            col_str(df_empenhos, "codUnidade")+ "." +
-            col_str(df_empenhos, "codFuncao")+ "." +
-            col_str(df_empenhos, "codSubFuncao")+ "." +
-            col_str(df_empenhos, "codPrograma")+ "." +
-            col_str(df_empenhos, "codProjetoAtividade")+ "." +
-            col_str(df_empenhos, "codCategoria") +
-            col_str(df_empenhos, "codGrupo") +
-            col_str(df_empenhos, "codModalidade") +
-            col_str(df_empenhos, "codElemento") + "00." +
+            col_str(df_empenhos, "codOrgao")+ "." + col_str(df_empenhos, "codUnidade")+ "." +
+            col_str(df_empenhos, "codFuncao")+ "." + col_str(df_empenhos, "codSubFuncao")+ "." +
+            col_str(df_empenhos, "codPrograma")+ "." + col_str(df_empenhos, "codProjetoAtividade")+ "." +
+            col_str(df_empenhos, "codCategoria") + col_str(df_empenhos, "codGrupo") +
+            col_str(df_empenhos, "codModalidade") + col_str(df_empenhos, "codElemento") + "00." +
             col_str(df_empenhos, "codFonteRecurso")
         )
 
-        codproc = (
-        df_empenhos["codProcesso"]
-        .astype("string")
-        .fillna("")
-        .str.replace(r"\D", "", regex=True)
-    )
+        codproc = df_empenhos["codProcesso"].astype("string").fillna("").str.replace(r"\D", "", regex=True)
         codproc = codproc.str.zfill(16)
         has_codproc = codproc.str.len() == 16
         df_empenhos.loc[has_codproc, "codProcesso"] = (
-            codproc.str.slice(0, 4)
-            + "."
-            + codproc.str.slice(4, 8)
-            + "/"
-            + codproc.str.slice(8, 15)
-            + "-"
-            + codproc.str.slice(15)
+            codproc.str.slice(0, 4) + "." + codproc.str.slice(4, 8) + "/" + codproc.str.slice(8, 15) + "-" + codproc.str.slice(15)
         )
 
         if "anexos" in df_empenhos.columns:
@@ -349,360 +348,327 @@ def main():
 
         list_empenhos.append(df_empenhos)
 
-    if list_empenhos:
-        df_final_empenhos = pd.concat(list_empenhos, ignore_index=True)
+    df_final_empenhos = pd.concat(list_empenhos, ignore_index=True) if list_empenhos else pd.DataFrame()
 
-    # Adicionar sigla do órgão utilizando lookup (considerando proj_ativ)
-    if not df_final_empenhos.empty:
+    sucesso_empenhos = not df_final_empenhos.empty
+
+    if sucesso_empenhos:
         def get_sigla_for_empenho(row):
             try:
                 orgao = str(row['codOrgao']).zfill(2)
                 proj_ativ = str(row['codProjetoAtividade']).zfill(4) if 'codProjetoAtividade' in row else ''
-                
-                # Tentar primeiro com orgao + proj_ativ
                 if proj_ativ:
                     chave_completa = f"{orgao}_{proj_ativ}"
                     sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
                     if sigla:
                         return sigla
-                
-                # Fallback: apenas orgao
                 return lookup_orgao_sigla.get(orgao, '')
             except:
                 return ''
         
         df_final_empenhos['sigla_orgao'] = df_final_empenhos.apply(get_sigla_for_empenho, axis=1)
+        df_final_empenhos['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
+        df_final_empenhos.to_excel(os.path.join(BASE_EXEC, "empenhos.xlsx"), index=False)
+    else:
+        print("\n⚠️ AVISO CRÍTICO: A API não retornou dados de empenhos válidos para hoje. O arquivo não será sobrescrito.")
 
-    df_final_empenhos['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
-    df_final_empenhos.to_excel(os.path.join(BASE_EXEC, f"empenhos.xlsx"), index=False)
+    # -------------------------------------------------------------
+    # 3. UPLOAD OBRIGATÓRIO PARA O GOOGLE DRIVE 
+    # -------------------------------------------------------------
+    if DRIVE_FOLDER_ID:
+        print("\n" + "="*60)
+        print("SINCROZINANDO BASES COM O GOOGLE DRIVE")
+        print("="*60)
+        drive_service = build_drive_service(SERVICE_ACCOUNT_FILE)
+        if drive_service:
+            if sucesso_execucao:
+                upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "execucao.xlsx"), DRIVE_FOLDER_ID)
+            if sucesso_empenhos:
+                upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "empenhos.xlsx"), DRIVE_FOLDER_ID)
+    else:
+        print("\nAviso: DRIVE_FOLDER_ID não configurado. Upload das bases pulado.")
 
-    # Comparação entre despesas_anterior e df_final
-    print("\n" + "="*60)
-    print("ANÁLISE DE MUDANÇAS")
-    print("="*60)
+    # -------------------------------------------------------------
+    # 4. COMPARAÇÃO E RELATÓRIO DE MUDANÇAS - EXECUÇÃO (Uso do Disponível)
+    # -------------------------------------------------------------
+    if sucesso_execucao:
+        print("\n" + "="*60)
+        print("ANÁLISE DE MUDANÇAS - EXECUÇÃO")
+        print("="*60)
 
-    # Normalizar dataframes
-    despesas_anterior_norm = normalizar_para_comparacao(despesas_anterior)
-    df_final_norm = normalizar_para_comparacao(df_final)
+        despesas_anterior_norm = normalizar_para_comparacao(despesas_anterior)
+        df_final_norm = normalizar_para_comparacao(df_final)
 
-    # Resetar índices para comparação
-    despesas_anterior_reset = despesas_anterior_norm.reset_index(drop=True)
-    df_final_reset = df_final_norm.reset_index(drop=True)
+        mudancas_exec = []
+        colunas_comuns = list(set(despesas_anterior_norm.columns) & set(df_final_norm.columns)) if not despesas_anterior_norm.empty else list(df_final_norm.columns)
 
-    # Criar dataframe para registrar mudanças
-    mudancas_exec = []
+        anterior_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in despesas_anterior_norm.iterrows()} if not despesas_anterior_norm.empty else {}
+        final_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in df_final_norm.iterrows()}
 
-    # Encontrar colunas comuns
-    colunas_comuns = list(set(despesas_anterior_reset.columns) & set(df_final_reset.columns))
+        # Linhas adicionadas
+        dotacoes_adicionadas = set(final_por_dotacao.keys()) - set(anterior_por_dotacao.keys())
+        if len(dotacoes_adicionadas) > 0:
+            print(f"\n✅ {len(dotacoes_adicionadas)} dotações ADICIONADAS")
+            for dotacao in dotacoes_adicionadas:
+                row = final_por_dotacao[dotacao]
+                if not row.get('dotacao_exclusiva'):
+                    continue
+                mudancas_exec.append({
+                    "tipo_mudanca": "ADICIONADA",
+                    "dotacao": dotacao,
+                    "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
+                    "coluna": "valDisponivel",
+                    "valor_anterior": 0,
+                    "valor_novo": row.get('valDisponivel', 0),
+                    "detalhes": "Nova dotação adicionada à base"
+                })
 
-    # Criar dicionários indexados por dotacao para comparação mais precisa
-    anterior_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in despesas_anterior_reset.iterrows()}
-    final_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in df_final_reset.iterrows()}
+        # Linhas modificadas (Agrupamento das colunas sob o guarda-chuva do 'Disponível')
+        dotacoes_comuns = set(anterior_por_dotacao.keys()) & set(final_por_dotacao.keys())
+        linhas_modificadas = []
 
-    # 2. Linhas adicionadas (em final mas não em anterior)
-    dotacoes_adicionadas = set(final_por_dotacao.keys()) - set(anterior_por_dotacao.keys())
-    if len(dotacoes_adicionadas) > 0:
-        print(f"\n✅ {len(dotacoes_adicionadas)} linhas ADICIONADAS")
-        for dotacao in dotacoes_adicionadas:
-            row = final_por_dotacao[dotacao]
-            if not row.get('dotacao_exclusiva'):
+        for dotacao in dotacoes_comuns:
+            linha_anterior = anterior_por_dotacao[dotacao]
+            linha_final = final_por_dotacao[dotacao]
+
+            if not_linha_final := not linha_final.get('dotacao_exclusiva'):
                 continue
-            # A coluna 'coluna' para ADICIONADA deve ser o valor de referência, que é 'valOrcadoAtualizado'
-            # O 'valor_anterior' é 0 para uma linha adicionada
-            mudancas_exec.append({
-                "tipo_mudanca": "ADICIONADA",
-                "dotacao": dotacao,
-                "dotacao_exclusiva": row.get('dotacao_exclusiva', ''),
-                "coluna": "valOrcadoAtualizado",
-                "valor_anterior": 0,
-                "valor_novo": row.get('valOrcadoAtualizado', 0)
-                # "detalhes": "Nova dotação identificada" # Adicionar se quiser um detalhe padrão
-            })
 
-    # 3. Linhas modificadas (comparar célula por célula)
-    dotacoes_comuns = set(anterior_por_dotacao.keys()) & set(final_por_dotacao.keys())
-    linhas_modificadas = []
+            def get_val_numeric(linha, col):
+                val = linha.get(col, 0)
+                if pd.isna(val) or val == '' or val is None:
+                    return 0.0
+                try:
+                    return float(val)
+                except:
+                    return 0.0
 
-    for dotacao in dotacoes_comuns:
-        linha_anterior = anterior_por_dotacao[dotacao]
-        linha_final = final_por_dotacao[dotacao]
+            val_ant_disp = get_val_numeric(linha_anterior, 'valDisponivel')
+            val_nov_disp = get_val_numeric(linha_final, 'valDisponivel')
+            
+            val_ant_supl = get_val_numeric(linha_anterior, 'valSuplementado')
+            val_nov_supl = get_val_numeric(linha_final, 'valSuplementado')
+            
+            val_ant_red = get_val_numeric(linha_anterior, 'valReduzido')
+            val_nov_red = get_val_numeric(linha_final, 'valReduzido')
+            
+            val_ant_cong = get_val_numeric(linha_anterior, 'valCongelado')
+            val_nov_cong = get_val_numeric(linha_final, 'valCongelado')
+            
+            val_ant_desc = get_val_numeric(linha_anterior, 'valDescongelado')
+            val_nov_desc = get_val_numeric(linha_final, 'valDescongelado')
 
-        if not linha_final.get('dotacao_exclusiva'):
-            continue
+            mudou_disponivel = round(val_ant_disp, 2) != round(val_nov_disp, 2)
+            mudou_suplementado = round(val_ant_supl, 2) != round(val_nov_supl, 2)
+            mudou_reduzido = round(val_ant_red, 2) != round(val_nov_red, 2)
+            mudou_congelado = round(val_ant_cong, 2) != round(val_nov_cong, 2)
+            mudou_descongelado = round(val_ant_desc, 2) != round(val_nov_desc, 2)
 
-        for col in colunas_mudanca_exec: # Usa a lista definida para verificar apenas colunas relevantes
-            if col not in colunas_comuns:
-                continue
+            if mudou_disponivel or mudou_suplementado or mudou_reduzido or mudou_congelado or mudou_descongelado:
+                alteracoes = []
+                if mudou_suplementado:
+                    var_supl = abs(val_nov_supl - val_ant_supl)
+                    alteracoes.append(f"Suplementado ({formatar_brl(var_supl)})")
+                if mudou_reduzido:
+                    var_red = abs(val_nov_red - val_ant_red)
+                    alteracoes.append(f"Reduzido ({formatar_brl(var_red)})")
+                if mudou_congelado:
+                    var_cong = abs(val_nov_cong - val_ant_cong)
+                    alteracoes.append(f"Congelado ({formatar_brl(var_cong)})")
+                if mudou_descongelado:
+                    var_desc = abs(val_nov_desc - val_ant_desc)
+                    alteracoes.append(f"Descongelado ({formatar_brl(var_desc)})")
 
-            if linha_anterior.get(col) != linha_final.get(col):
+                detalhes_outros = "; ".join(alteracoes) if alteracoes else "Apenas Disponível alterado"
+
                 linhas_modificadas.append({
                     "dotacao": dotacao,
                     "dotacao_exclusiva": linha_final.get('dotacao_exclusiva', ''),
-                    "coluna": col,
-                    "valor_anterior": linha_anterior.get(col),
-                    "valor_novo": linha_final.get(col),
-                    # "detalhes": f"Valor alterado de {linha_anterior.get(col)} para {linha_final.get(col)}" # Adicionar se quiser detalhes
+                    "coluna": "valDisponivel",
+                    "valor_anterior": val_ant_disp,
+                    "valor_novo": val_nov_disp,
+                    "detalhes": detalhes_outros
                 })
 
-    if len(linhas_modificadas) > 0:
-        print(f"\n🔄 {len(linhas_modificadas)} MUDANÇAS DE VALORES")
-        for mudanca in linhas_modificadas:
-            print(f"   Dotação {mudanca['dotacao']}, Coluna '{mudanca['coluna']}':")
-            print(f"   {mudanca['valor_anterior']} → {mudanca['valor_novo']}")
-            mudancas_exec.append({
-                "tipo_mudanca": "MODIFICADA",
-                "dotacao": mudanca['dotacao'],
-                "dotacao_exclusiva": mudanca['dotacao_exclusiva'],
-                "coluna": mudanca['coluna'],
-                "valor_anterior": mudanca['valor_anterior'],
-                "valor_novo": mudanca['valor_novo'],
-                # "detalhes": f"Valor alterado de {mudanca['valor_anterior']} para {mudanca['valor_novo']}" # Adicionar se quiser detalhes
-            })
+        if len(linhas_modificadas) > 0:
+            print(f"\n🔄 {len(linhas_modificadas)} MUDANÇAS DE VALORES")
+            for mudanca in linhas_modificadas:
+                mudancas_exec.append({
+                    "tipo_mudanca": "MODIFICADA",
+                    "dotacao": mudanca['dotacao'],
+                    "dotacao_exclusiva": mudanca['dotacao_exclusiva'],
+                    "coluna": mudanca['coluna'],
+                    "valor_anterior": mudanca['valor_anterior'],
+                    "valor_novo": mudanca['valor_novo'],
+                    "detalhes": mudanca['detalhes']
+                })
 
-    # Salvar relatório de mudanças
-    if mudancas_exec:
-        df_mudancas = pd.DataFrame(mudancas_exec)
-        df_mudancas['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
-        
-        # Preencher NaN em colunas de valor com '-' para exibição amigável
-        # Isso é feito APÓS a comparação e antes da formatação BRL
-        if 'valor_anterior' in df_mudancas.columns: # Verifica se a coluna existe
-            df_mudancas['valor_anterior'] = df_mudancas['valor_anterior'].apply(lambda x: '-' if pd.isna(x) else x)
-        if 'valor_novo' in df_mudancas.columns: # Verifica se a coluna existe
-            df_mudancas['valor_novo'] = df_mudancas['valor_novo'].apply(lambda x: '-' if pd.isna(x) else x)
-        
-        # Adicionar sigla do órgão usando lookup
-        def get_sigla_from_dotacao(dotacao_str):
-            if pd.isna(dotacao_str) or dotacao_str == '':
-                return ''
-            # A dotação tem o formato: orgao.uo.funcao.subfuncao.programa.proj_ativ...
-            try:
-                partes = dotacao_str.split('.')
-                if len(partes) < 6:
-                    # Se não conseguir extrair proj_ativ, tentar apenas orgao
-                    orgao = partes[0] if len(partes) > 0 else ''
-                    return lookup_orgao_sigla.get(orgao, '')
-                    
-                orgao = partes[0]
-                proj_ativ = partes[5]  # proj_ativ está na posição 5 (0-indexed)
-                
-                # Tentar primeiro com orgao + proj_ativ
-                chave_completa = f"{orgao}_{proj_ativ}"
-                sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
-                
-                # Se não encontrar, tentar apenas com orgao
-                if not sigla:
-                    sigla = lookup_orgao_sigla.get(orgao, '')
-                    
-                return sigla
-            except:
-                return ''
-        
-        df_mudancas['sigla_orgao'] = df_mudancas['dotacao'].apply(get_sigla_from_dotacao)
-        
-        # Renomeia para nomes amigáveis
-        df_mudancas = df_mudancas.rename(columns={
-            "sigla_orgao": "Sigla Órgão",
-            "dotacao": "Dotação",
-            "dotacao_exclusiva": "Dotação Exclusiva",
-            "coluna": "Campo Alterado",
-            "valor_anterior": "Valor Anterior",
-            "valor_novo": "Valor Atualizado",
-            "data_hora_extracao": "Data/Hora Extração"
-        })
-        
-        # Reordenar colunas: Sigla Órgão como primeira, Valor Atualizado na penúltima, Data/Hora Extração na última
-        # Usar apenas as colunas que existem
-        colunas_ordenadas = ['Sigla Órgão', 'Tipo de Mudança', 'Dotação', 'Dotação Exclusiva', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
-        colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas.columns]
-        # Adicionar qualquer coluna extra que não estava na lista
-        colunas_extra = [c for c in df_mudancas.columns if c not in colunas_existentes]
-        df_mudancas = df_mudancas[colunas_existentes + colunas_extra]
-        
-        # Formatar colunas de valores para BRL
-        if 'Valor Anterior' in df_mudancas.columns:
-            df_mudancas['Valor Anterior'] = df_mudancas['Valor Anterior'].apply(formatar_brl)
-        if 'Valor Atualizado' in df_mudancas.columns:
-            df_mudancas['Valor Atualizado'] = df_mudancas['Valor Atualizado'].apply(formatar_brl)
-        
-        df_mudancas.to_excel(os.path.join(BASE_EXEC, f"mudancas_execucao.xlsx"), index=False)
-        print(f"\n📊 Relatório salvo em: mudancas_execucao.xlsx")
-    else:
-        print("\n✨ Nenhuma mudança detectada!")
-
-    print("="*60)
-
-    # Comparação entre empenhos_anterior e df_final_empenhos
-    print("\n" + "="*60)
-    print("ANÁLISE DE MUDANÇAS - EMPENHOS")
-    print("="*60)
-
-    # DEBUG: Verificar se os dataframes têm dados
-    print(f"DEBUG: empenhos_anterior shape: {empenhos_anterior.shape}")
-    print(f"DEBUG: df_final_empenhos shape: {df_final_empenhos.shape}")
-    print(f"DEBUG: empenhos_anterior colunas: {list(empenhos_anterior.columns)}")
-    print(f"DEBUG: df_final_empenhos colunas: {list(df_final_empenhos.columns)}")
-
-    # Normalizar dataframes
-    empenhos_anterior_norm = normalizar_para_comparacao(empenhos_anterior)
-    df_final_empenhos_norm = normalizar_para_comparacao(df_final_empenhos)
-
-    print(f"DEBUG: empenhos_anterior_norm shape: {empenhos_anterior_norm.shape}")
-    print(f"DEBUG: df_final_empenhos_norm shape: {df_final_empenhos_norm.shape}")
-
-    # Resetar índices para comparação
-    empenhos_anterior_reset = empenhos_anterior_norm.reset_index(drop=True)
-    df_final_empenhos_reset = df_final_empenhos_norm.reset_index(drop=True)
-
-    # Encontrar colunas comuns
-    colunas_comuns_emp = list(set(empenhos_anterior_reset.columns) & set(df_final_empenhos_reset.columns))
-    print(f"DEBUG: Colunas comuns: {len(colunas_comuns_emp)}")
-
-    # Helper para garantir que o ID seja uma string limpa
-    def format_id_key(val):
-        s = str(val).strip()
-        if s.endswith('.0'):
-            return s[:-2]
-        return s
-
-    # Verificar se codEmpenho existe
-    if 'codEmpenho' in empenhos_anterior_reset.columns:
-        anterior_emp_dict = {format_id_key(row['codEmpenho']): row.to_dict() for idx, row in empenhos_anterior_reset.iterrows()}
-    else:
-        print("DEBUG: 'codEmpenho' NÃO encontrado em empenhos_anterior_reset")
-        anterior_emp_dict = {}
-
-    if 'codEmpenho' in df_final_empenhos_reset.columns:
-        final_emp_dict = {format_id_key(row['codEmpenho']): row.to_dict() for idx, row in df_final_empenhos_reset.iterrows()}
-    else:
-        print("DEBUG: 'codEmpenho' NÃO encontrado em df_final_empenhos_reset")
-        final_emp_dict = {}
-
-    print(f"DEBUG: anterior_emp_dict tamanho: {len(anterior_emp_dict)}")
-    print(f"DEBUG: final_emp_dict tamanho: {len(final_emp_dict)}")
-    print(f"DEBUG: Primeiras 3 chaves anterior: {list(anterior_emp_dict.keys())[:3]}")
-    print(f"DEBUG: Primeiras 3 chaves final: {list(final_emp_dict.keys())[:3]}")
-
-    # Criar dataframe para registrar mudanças
-    mudancas_emp = []
-
-    # 2. Linhas adicionadas
-    ids_adicionados = set(final_emp_dict.keys()) - set(anterior_emp_dict.keys())
-    print(f"DEBUG: IDs adicionados: {len(ids_adicionados)}")
-
-    if ids_adicionados:
-        print(f"\n✅ {len(ids_adicionados)} empenhos ADICIONADOS")
-        for eid in ids_adicionados:
-            row = final_emp_dict[eid]
-            mudancas_emp.append({
-                "numProcesso": row.get('codProcesso', ''),
-                "dotacao": row.get('dotacao_completa', ''),
-                "codEmpenho": eid,
-                "numeroOriginalContrato": row.get('numeroOriginalContrato', ''),
-                "coluna": "valEmpenhadoLiquido",
-                "valor_anterior": 0,
-                "valor_novo": row.get('valTotalEmpenhado', 0)
-            })
-
-    # 3. Linhas modificadas
-    ids_comuns = set(anterior_emp_dict.keys()) & set(final_emp_dict.keys())
-    print(f"DEBUG: IDs comuns: {len(ids_comuns)}")
-
-    for eid in ids_comuns:
-        linha_ant = anterior_emp_dict[eid]
-        linha_fin = final_emp_dict[eid]
-        
-        for col in colunas_comuns_emp:
-            # Notificar apenas mudanças em colunas de valores (val...)
-            if not col.startswith('val') or col == 'data_hora_extracao':
-                continue
-                
-            val_ant = linha_ant.get(col)
-            val_fin = linha_fin.get(col)
+        if mudancas_exec:
+            df_mudancas = pd.DataFrame(mudancas_exec)
+            df_mudancas['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
             
-            if val_ant != val_fin: # Comparação direta após normalização deve ser suficiente
+            df_mudancas['valor_anterior'] = df_mudancas['valor_anterior'].apply(lambda x: '-' if pd.isna(x) else x)
+            df_mudancas['valor_novo'] = df_mudancas['valor_novo'].apply(lambda x: '-' if pd.isna(x) else x)
+            
+            def get_sigla_from_dotacao(dotacao_str):
+                if pd.isna(dotacao_str) or dotacao_str == '':
+                    return ''
+                try:
+                    partes = dotacao_str.split('.')
+                    if len(partes) < 6:
+                        orgao = partes[0] if len(partes) > 0 else ''
+                        return lookup_orgao_sigla.get(orgao, '')
+                    orgao = partes[0]
+                    proj_ativ = partes[5]
+                    chave_completa = f"{orgao}_{proj_ativ}"
+                    sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
+                    if not sigla:
+                        sigla = lookup_orgao_sigla.get(orgao, '')
+                    return sigla
+                except:
+                    return ''
+            
+            df_mudancas['sigla_orgao'] = df_mudancas['dotacao'].apply(get_sigla_from_dotacao)
+            
+            df_mudancas = df_mudancas.rename(columns={
+                "sigla_orgao": "Sigla Órgão",
+                "tipo_mudanca": "Tipo de Mudança",
+                "dotacao": "Dotação",
+                "dotacao_exclusiva": "Dotação Exclusiva",
+                "coluna": "Campo Alterado",
+                "valor_anterior": "Valor Anterior",
+                "valor_novo": "Valor Atualizado",
+                "detalhes": "Detalhes",
+                "data_hora_extracao": "Data/Hora Extração"
+            })
+            
+            colunas_ordenadas = ['Sigla Órgão', 'Tipo de Mudança', 'Dotação', 'Dotação Exclusiva', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Detalhes', 'Data/Hora Extração']
+            colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas.columns]
+            colunas_extra = [c for c in df_mudancas.columns if c not in colunas_existentes]
+            df_mudancas = df_mudancas[colunas_existentes + colunas_extra]
+            
+            df_mudancas['Valor Anterior'] = df_mudancas['Valor Anterior'].apply(formatar_brl)
+            df_mudancas['Valor Atualizado'] = df_mudancas['Valor Atualizado'].apply(formatar_brl)
+            
+            df_mudancas.to_excel(os.path.join(BASE_EXEC, "mudancas_execucao.xlsx"), index=False)
+            print(f"\n📊 Relatório salvo em: mudancas_execucao.xlsx")
+        else:
+            print("\n✨ Nenhuma mudança detectada na execução!")
+
+    # -------------------------------------------------------------
+    # 5. COMPARAÇÃO E RELATÓRIO DE MUDANÇAS - EMPENHOS
+    # -------------------------------------------------------------
+    if sucesso_empenhos:
+        print("\n" + "="*60)
+        print("ANÁLISE DE MUDANÇAS - EMPENHOS")
+        print("="*60)
+
+        empenhos_anterior_norm = normalizar_para_comparacao(empenhos_anterior)
+        df_final_empenhos_norm = normalizar_para_comparacao(df_final_empenhos)
+
+        colunas_comuns_emp = list(set(empenhos_anterior_norm.columns) & set(df_final_empenhos_norm.columns)) if not empenhos_anterior_norm.empty else list(df_final_empenhos_norm.columns)
+
+        def format_emp_key(row):
+            """Cria chave composta para evitar sobrescrita de itens de um mesmo empenho."""
+            cod = str(row.get('codEmpenho', '')).strip()
+            if cod.endswith('.0'): cod = cod[:-2]
+            dot = str(row.get('dotacao_completa', '')).strip()
+            return f"{cod}_{dot}"
+
+        anterior_emp_dict = {format_emp_key(row): row.to_dict() for idx, row in empenhos_anterior_norm.iterrows()} if not empenhos_anterior_norm.empty else {}
+        final_emp_dict = {format_emp_key(row): row.to_dict() for idx, row in df_final_empenhos_norm.iterrows()} if not df_final_empenhos_norm.empty else {}
+
+        mudancas_emp = []
+
+        ids_adicionados = set(final_emp_dict.keys()) - set(anterior_emp_dict.keys())
+        if ids_adicionados:
+            print(f"\n✅ {len(ids_adicionados)} empenhos/itens ADICIONADOS")
+            for dict_key in ids_adicionados:
+                row = final_emp_dict[dict_key]
                 mudancas_emp.append({
-                    "dotacao": linha_fin.get('dotacao_completa', ''),
-                    "codEmpenho": eid,
-                    "numProcesso": linha_fin.get('codProcesso', ''),
-                    "numeroOriginalContrato": linha_fin.get('numeroOriginalContrato', ''),
-                    "coluna": col,
-                    "valor_anterior": val_ant, # Valores já normalizados
-                    "valor_novo": val_fin, # Valores já normalizados
+                    "numProcesso": row.get('codProcesso', ''),
+                    "dotacao": row.get('dotacao_completa', ''),
+                    "codEmpenho": row.get('codEmpenho', ''),
+                    "numeroOriginalContrato": row.get('numeroOriginalContrato', ''),
+                    "coluna": "valEmpenhadoLiquido",
+                    "valor_anterior": 0,
+                    "valor_novo": row.get('valTotalEmpenhado', 0)
                 })
 
-    # Salvar relatório
-    if mudancas_emp:
-        df_mudancas_emp = pd.DataFrame(mudancas_emp)
-        df_mudancas_emp['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
-        
-        # Preencher NaN em colunas de valor com '-' para exibição amigável
-        # Isso é feito APÓS a comparação e antes da formatação BRL
-        if 'valor_anterior' in df_mudancas_emp.columns: # Verifica se a coluna existe
+        ids_comuns = set(anterior_emp_dict.keys()) & set(final_emp_dict.keys())
+        for dict_key in ids_comuns:
+            linha_ant = anterior_emp_dict[dict_key]
+            linha_fin = final_emp_dict[dict_key]
+            
+            for col in colunas_comuns_emp:
+                if not col.startswith('val') or col == 'data_hora_extracao':
+                    continue
+                    
+                val_ant = linha_ant.get(col)
+                val_fin = linha_fin.get(col)
+                
+                if val_ant != val_fin:
+                    mudancas_emp.append({
+                        "dotacao": linha_fin.get('dotacao_completa', ''),
+                        "codEmpenho": linha_fin.get('codEmpenho', ''),
+                        "numProcesso": linha_fin.get('codProcesso', ''),
+                        "numeroOriginalContrato": linha_fin.get('numeroOriginalContrato', ''),
+                        "coluna": col,
+                        "valor_anterior": val_ant,
+                        "valor_novo": val_fin,
+                    })
+
+        if mudancas_emp:
+            df_mudancas_emp = pd.DataFrame(mudancas_emp)
+            df_mudancas_emp['data_hora_extracao'] = dt_inicio.strftime('%d/%m/%Y %H:%M:%S')
+            
             df_mudancas_emp['valor_anterior'] = df_mudancas_emp['valor_anterior'].apply(lambda x: '-' if pd.isna(x) else x)
-        if 'valor_novo' in df_mudancas_emp.columns: # Verifica se a coluna existe
             df_mudancas_emp['valor_novo'] = df_mudancas_emp['valor_novo'].apply(lambda x: '-' if pd.isna(x) else x)
-        
-        # Adicionar sigla do órgão usando lookup
-        def get_sigla_from_dotacao_emp(dotacao_str):
-            if pd.isna(dotacao_str) or dotacao_str == '':
-                return ''
-            # A dotação tem o formato: orgao.uo.funcao.subfuncao.programa.proj_ativ...
-            # Observação: para empenhos a dotação é `dotacao_completa` que é construída diferentemente
-            try:
-                partes = dotacao_str.split('.')
-                if len(partes) < 6:
-                    # Se não conseguir extrair proj_ativ, tentar apenas orgao
-                    orgao = partes[0] if len(partes) > 0 else ''
-                    return lookup_orgao_sigla.get(orgao, '')
-                    
-                orgao = partes[0]
-                proj_ativ = partes[5]  # proj_ativ está na posição 5 (0-indexed)
-                
-                # Tentar primeiro com orgao + proj_ativ
-                chave_completa = f"{orgao}_{proj_ativ}"
-                sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
-                
-                # Se não encontrar, tentar apenas com orgao
-                if not sigla:
-                    sigla = lookup_orgao_sigla.get(orgao, '')
-                    
-                return sigla
-            except:
-                return ''
-        
-        df_mudancas_emp['sigla_orgao'] = df_mudancas_emp['dotacao'].apply(get_sigla_from_dotacao_emp)
-        
-        # Renomeia para nomes amigáveis
-        df_mudancas_emp = df_mudancas_emp.rename(columns={
-            "sigla_orgao": "Sigla Órgão",
-            "numProcesso": "Processo SEI",
-            "dotacao": "Dotação",
-            "codEmpenho": "Código do Empenho",
-            "numeroOriginalContrato": "Número do Contrato",
-            "coluna": "Campo Alterado",
-            "valor_anterior": "Valor Anterior",
-            "valor_novo": "Valor Atualizado",
-            "data_hora_extracao": "Data/Hora Extração"
-        })
-        
-        # Reordenar colunas: Sigla Órgão como primeira coluna, Processo SEI como segunda
-        colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
-        colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas_emp.columns]
-        colunas_extra = [c for c in df_mudancas_emp.columns if c not in colunas_existentes]
-        df_mudancas_emp = df_mudancas_emp[colunas_existentes + colunas_extra]
-        
-        # Formatar colunas de valores para BRL
-        if 'Valor Anterior' in df_mudancas_emp.columns:
+            
+            def get_sigla_from_dotacao_emp(dotacao_str):
+                if pd.isna(dotacao_str) or dotacao_str == '':
+                    return ''
+                try:
+                    partes = dotacao_str.split('.')
+                    if len(partes) < 6:
+                        orgao = partes[0] if len(partes) > 0 else ''
+                        return lookup_orgao_sigla.get(orgao, '')
+                    orgao = partes[0]
+                    proj_ativ = partes[5]
+                    chave_completa = f"{orgao}_{proj_ativ}"
+                    sigla = lookup_orgao_proj_ativ_sigla.get(chave_completa, '')
+                    if not sigla:
+                        sigla = lookup_orgao_sigla.get(orgao, '')
+                    return sigla
+                except:
+                    return ''
+            
+            df_mudancas_emp['sigla_orgao'] = df_mudancas_emp['dotacao'].apply(get_sigla_from_dotacao_emp)
+            
+            df_mudancas_emp = df_mudancas_emp.rename(columns={
+                "sigla_orgao": "Sigla Órgão",
+                "numProcesso": "Processo SEI",
+                "dotacao": "Dotação",
+                "codEmpenho": "Código do Empenho",
+                "numeroOriginalContrato": "Número do Contrato",
+                "coluna": "Campo Alterado",
+                "valor_anterior": "Valor Anterior",
+                "valor_novo": "Valor Atualizado",
+                "data_hora_extracao": "Data/Hora Extração"
+            })
+            
+            colunas_ordenadas = ['Sigla Órgão', 'Processo SEI', 'Dotação', 'Código do Empenho', 'Número do Contrato', 'Campo Alterado', 'Valor Anterior', 'Valor Atualizado', 'Data/Hora Extração']
+            colunas_existentes = [c for c in colunas_ordenadas if c in df_mudancas_emp.columns]
+            colunas_extra = [c for c in df_mudancas_emp.columns if c not in colunas_existentes]
+            df_mudancas_emp = df_mudancas_emp[colunas_existentes + colunas_extra]
+            
             df_mudancas_emp['Valor Anterior'] = df_mudancas_emp['Valor Anterior'].apply(formatar_brl)
-        if 'Valor Atualizado' in df_mudancas_emp.columns:
             df_mudancas_emp['Valor Atualizado'] = df_mudancas_emp['Valor Atualizado'].apply(formatar_brl)
-        
-        df_mudancas_emp.to_excel(os.path.join(BASE_EXEC, f"mudancas_empenhos.xlsx"), index=False)
-        print(f"\n📊 Relatório salvo em: mudancas_empenhos.xlsx")
-    else:
-        print(f"\nDEBUG: mudancas_emp está vazio - total de mudanças registradas: {len(mudancas_emp)}")
-        print("\n✨ Nenhuma mudança detectada nos empenhos!")
+            
+            df_mudancas_emp.to_excel(os.path.join(BASE_EXEC, "mudancas_empenhos.xlsx"), index=False)
+            print(f"\n📊 Relatório salvo em: mudancas_empenhos.xlsx")
+        else:
+            print("\n✨ Nenhuma mudança detectada nos empenhos!")
 
     print("="*60)
 
