@@ -32,6 +32,7 @@ jobs:
         env:
           API_TOKEN_SF: ${{ secrets.API_TOKEN_SF }}
           CNPJ_ADESAMPA: ${{ secrets.CNPJ_ADESAMPA }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python consulta_sof.py
         
       - name: Executar send_reports.py
@@ -40,8 +41,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: service_account.json
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: service_account.json          
         run: python send_reports.py
         
       - name: Upload relatórios como artefatos
