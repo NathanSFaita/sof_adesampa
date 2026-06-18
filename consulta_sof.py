@@ -6,11 +6,12 @@ import time
 from datetime import datetime, timedelta, timezone
 import threading
 import pytz
+import io # <-- NOVO IMPORT NECESSÁRIO
 
 # Google Drive API
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload # <-- NOVO IMPORT NECESSÁRIO
 
 # Configurações iniciais
 tz_brasilia = pytz.timezone('America/Sao_Paulo')
@@ -85,6 +86,26 @@ def get_file_in_folder(service, file_name, folder_id):
         print(f"Erro ao buscar arquivo no Drive ({file_name}): {e}")
         return None
 
+# --- NOVA FUNÇÃO DE DOWNLOAD ---
+def download_file_from_drive(service, file_name, folder_id, dest_path):
+    try:
+        file_id = get_file_in_folder(service, file_name, folder_id)
+        if not file_id:
+            print(f"Aviso: {file_name} não encontrado no Drive. Usando base local vazia/existente.")
+            return False
+        
+        request = service.files().get_media(fileId=file_id)
+        fh = io.FileIO(dest_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+        print(f"✅ Download do Drive concluído: {file_name}")
+        return True
+    except Exception as e:
+        print(f"Erro ao baixar {file_name} do Drive: {e}")
+        return False
+
 def upload_or_update_file(service, file_path, folder_id):
     if not os.path.exists(file_path):
         print(f"Aviso: arquivo não existe para upload no Drive: {file_path}")
@@ -133,6 +154,19 @@ def main():
     DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     if not DRIVE_FOLDER_ID:
         DRIVE_FOLDER_ID = input_with_timeout("Digite o ID da pasta do Google Drive para upload (DRIVE_FOLDER_ID): ", timeout=30)
+
+    # -------------------------------------------------------------
+    # NOVO FLUXO: DOWNLOAD DA BASE HISTÓRICA DO DRIVE
+    # -------------------------------------------------------------
+    os.makedirs(BASE_EXEC, exist_ok=True) # Garante que a pasta base_execucao existe
+    drive_service = build_drive_service(SERVICE_ACCOUNT_FILE) if DRIVE_FOLDER_ID else None
+    
+    if drive_service and DRIVE_FOLDER_ID:
+        print("\n" + "="*60)
+        print("BAIXANDO BASES MAIS RECENTES DO GOOGLE DRIVE")
+        print("="*60)
+        download_file_from_drive(drive_service, "execucao.xlsx", DRIVE_FOLDER_ID, os.path.join(BASE_EXEC, "execucao.xlsx"))
+        download_file_from_drive(drive_service, "empenhos.xlsx", DRIVE_FOLDER_ID, os.path.join(BASE_EXEC, "empenhos.xlsx"))
 
     def fazer_requisicao(endpoint, params=None, token=None):
         BASE_URL = "https://gateway.apilib.prefeitura.sp.gov.br/sf/sof/v4/"
@@ -375,16 +409,14 @@ def main():
     # -------------------------------------------------------------
     # 3. UPLOAD OBRIGATÓRIO PARA O GOOGLE DRIVE 
     # -------------------------------------------------------------
-    if DRIVE_FOLDER_ID:
+    if drive_service and DRIVE_FOLDER_ID:
         print("\n" + "="*60)
-        print("SINCROZINANDO BASES COM O GOOGLE DRIVE")
+        print("SINCROZINANDO BASES ATUALIZADAS COM O GOOGLE DRIVE")
         print("="*60)
-        drive_service = build_drive_service(SERVICE_ACCOUNT_FILE)
-        if drive_service:
-            if sucesso_execucao:
-                upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "execucao.xlsx"), DRIVE_FOLDER_ID)
-            if sucesso_empenhos:
-                upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "empenhos.xlsx"), DRIVE_FOLDER_ID)
+        if sucesso_execucao:
+            upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "execucao.xlsx"), DRIVE_FOLDER_ID)
+        if sucesso_empenhos:
+            upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "empenhos.xlsx"), DRIVE_FOLDER_ID)
     else:
         print("\nAviso: DRIVE_FOLDER_ID não configurado. Upload das bases pulado.")
 
@@ -399,11 +431,12 @@ def main():
         despesas_anterior_norm = normalizar_para_comparacao(despesas_anterior)
         df_final_norm = normalizar_para_comparacao(df_final)
 
-        mudancas_exec = []
         colunas_comuns = list(set(despesas_anterior_norm.columns) & set(df_final_norm.columns)) if not despesas_anterior_norm.empty else list(df_final_norm.columns)
 
         anterior_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in despesas_anterior_norm.iterrows()} if not despesas_anterior_norm.empty else {}
         final_por_dotacao = {str(row.get('dotacao', '')): row for idx, row in df_final_norm.iterrows()}
+
+        mudancas_exec = []
 
         # Linhas adicionadas
         dotacoes_adicionadas = set(final_por_dotacao.keys()) - set(anterior_por_dotacao.keys())
