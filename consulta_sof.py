@@ -6,12 +6,12 @@ import time
 from datetime import datetime, timedelta, timezone
 import threading
 import pytz
-import io # <-- NOVO IMPORT NECESSÁRIO
+import io 
 
 # Google Drive API
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload # <-- NOVO IMPORT NECESSÁRIO
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload 
 
 # Configurações iniciais
 tz_brasilia = pytz.timezone('America/Sao_Paulo')
@@ -151,22 +151,27 @@ def main():
         "GOOGLE_SERVICE_ACCOUNT_JSON",
         os.path.join(BASE_PATH, "service_account.json")
     )
-    DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    if not DRIVE_FOLDER_ID:
-        DRIVE_FOLDER_ID = input_with_timeout("Digite o ID da pasta do Google Drive para upload (DRIVE_FOLDER_ID): ", timeout=30)
+    DRIVE_FOLDER_IDS_RAW = os.getenv("DRIVE_FOLDER_ID")
+    if not DRIVE_FOLDER_IDS_RAW:
+        DRIVE_FOLDER_IDS_RAW = input_with_timeout("Digite os IDs das pastas do Google Drive separados por vírgula: ", timeout=30)
+
+    # Cria uma lista de IDs limpando os espaços em branco
+    DRIVE_FOLDER_IDS = [fid.strip() for fid in DRIVE_FOLDER_IDS_RAW.split(',')] if DRIVE_FOLDER_IDS_RAW else []
+    # Define a primeira pasta da lista como a pasta principal para os downloads
+    PRIMARY_DRIVE_FOLDER_ID = DRIVE_FOLDER_IDS[0] if DRIVE_FOLDER_IDS else None
 
     # -------------------------------------------------------------
     # NOVO FLUXO: DOWNLOAD DA BASE HISTÓRICA DO DRIVE
     # -------------------------------------------------------------
     os.makedirs(BASE_EXEC, exist_ok=True) # Garante que a pasta base_execucao existe
-    drive_service = build_drive_service(SERVICE_ACCOUNT_FILE) if DRIVE_FOLDER_ID else None
+    drive_service = build_drive_service(SERVICE_ACCOUNT_FILE) if PRIMARY_DRIVE_FOLDER_ID else None
     
-    if drive_service and DRIVE_FOLDER_ID:
+    if drive_service and PRIMARY_DRIVE_FOLDER_ID:
         print("\n" + "="*60)
-        print("BAIXANDO BASES MAIS RECENTES DO GOOGLE DRIVE")
+        print(f"BAIXANDO BASES MAIS RECENTES DO GOOGLE DRIVE (Pasta Principal)")
         print("="*60)
-        download_file_from_drive(drive_service, "execucao.xlsx", DRIVE_FOLDER_ID, os.path.join(BASE_EXEC, "execucao.xlsx"))
-        download_file_from_drive(drive_service, "empenhos.xlsx", DRIVE_FOLDER_ID, os.path.join(BASE_EXEC, "empenhos.xlsx"))
+        download_file_from_drive(drive_service, "execucao.xlsx", PRIMARY_DRIVE_FOLDER_ID, os.path.join(BASE_EXEC, "execucao.xlsx"))
+        download_file_from_drive(drive_service, "empenhos.xlsx", PRIMARY_DRIVE_FOLDER_ID, os.path.join(BASE_EXEC, "empenhos.xlsx"))
 
     def fazer_requisicao(endpoint, params=None, token=None):
         BASE_URL = "https://gateway.apilib.prefeitura.sp.gov.br/sf/sof/v4/"
@@ -409,16 +414,18 @@ def main():
     # -------------------------------------------------------------
     # 3. UPLOAD OBRIGATÓRIO PARA O GOOGLE DRIVE 
     # -------------------------------------------------------------
-    if drive_service and DRIVE_FOLDER_ID:
+    if drive_service and DRIVE_FOLDER_IDS:
         print("\n" + "="*60)
         print("SINCROZINANDO BASES ATUALIZADAS COM O GOOGLE DRIVE")
         print("="*60)
-        if sucesso_execucao:
-            upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "execucao.xlsx"), DRIVE_FOLDER_ID)
-        if sucesso_empenhos:
-            upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "empenhos.xlsx"), DRIVE_FOLDER_ID)
+        for folder_id in DRIVE_FOLDER_IDS:
+            print(f"\n📁 Sincronizando com a pasta: {folder_id}")
+            if sucesso_execucao:
+                upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "execucao.xlsx"), folder_id)
+            if sucesso_empenhos:
+                upload_or_update_file(drive_service, os.path.join(BASE_EXEC, "empenhos.xlsx"), folder_id)
     else:
-        print("\nAviso: DRIVE_FOLDER_ID não configurado. Upload das bases pulado.")
+        print("\nAviso: Pastas do Google Drive não configuradas. Upload das bases pulado.")
 
     # -------------------------------------------------------------
     # 4. COMPARAÇÃO E RELATÓRIO DE MUDANÇAS - EXECUÇÃO (Uso do Disponível)
